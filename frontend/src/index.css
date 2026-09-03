@@ -1,0 +1,57 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-display: 'Rubik', 'Segoe UI', system-ui, sans-serif;
+  --font-sans: 'Inter', 'Segoe UI', system-ui, sans-serif;
+
+  --color-site-950: #0b0d10;
+  --color-site-900: #14171b;
+  --color-site-800: #1e2227;
+  --color-site-700: #2b3038;
+  --color-site-600: #3c424c;
+  --color-site-500: #5a6270;
+  --color-site-400: #8a919c;
+  --color-site-300: #b8bec6;
+  --color-site-200: #dde0e4;
+  --color-site-100: #eef0f2;
+
+  --color-safety-600: #c2540a;
+  --color-safety-500: #f2790f;
+  --color-safety-400: #f89b1c;
+  --color-safety-300: #ffb238;
+
+  --color-hazard-500: #f7c331;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-site-950 text-site-100;
+  font-family: var(--font-sans);
+  background-image:
+    radial-gradient(circle at 15% 10%, rgba(242, 121, 15, 0.08), transparent 40%),
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size:
+    auto,
+    40px 40px,
+    40px 40px;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.hazard-stripes {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--color-hazard-500) 0 14px,
+    var(--color-site-900) 14px 28px
+  );
+}
+
+.text-hazard-outline {
+  -webkit-text-stroke: 1px rgba(0, 0, 0, 0.25);
+}
