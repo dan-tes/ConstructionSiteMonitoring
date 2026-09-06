@@ -1,8 +1,8 @@
-import { mockAuthApi } from './mockAuthApi'
+import { httpAuthApi } from './httpAuthApi'
 import type { AuthApi } from './types'
 
-// Swap this for a real HTTP-backed implementation once the backend exists —
-// everything else in the app talks to the AuthApi interface, not to this file.
-export const authApi: AuthApi = mockAuthApi
+// Real HTTP implementation backed by the FastAPI service (see backend/).
+// Swap for ./mockAuthApi to work offline against localStorage.
+export const authApi: AuthApi = httpAuthApi
 
 export * from './types'

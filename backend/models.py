@@ -1,0 +1,139 @@
+import uuid
+from datetime import date, datetime
+
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, Uuid, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from database import Base
+
+
+def _uuid() -> uuid.UUID:
+    return uuid.uuid4()
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=_uuid)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    salt: Mapped[str] = mapped_column(String(128), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    sessions: Mapped[list["Session"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    projects: Mapped[list["Project"]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan"
+    )
+
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=_uuid)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # Project-level summary generated from the latest analysed video (see analysis.py).
+    plan_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    owner: Mapped[User] = relationship(back_populates="projects")
+    entries: Mapped[list["JournalEntry"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="JournalEntry.date.desc(), JournalEntry.created_at.desc()",
+    )
+    assets: Mapped[list["MediaAsset"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+    @property
+    def plan_asset(self) -> "MediaAsset | None":
+        return next((a for a in self.assets if a.role == "plan"), None)
+
+
+class JournalEntry(Base):
+    __tablename__ = "journal_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    comment: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    author: Mapped[str] = mapped_column(String(64), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="entries")
+    media: Mapped[list["MediaAsset"]] = relationship(
+        back_populates="entry",
+        cascade="all, delete-orphan",
+        order_by="MediaAsset.created_at",
+    )
+
+
+class MediaAsset(Base):
+    __tablename__ = "media_assets"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Null for the project plan; set for journal videos and (later) extracted frames.
+    entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), ForeignKey("journal_entries.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    # Source video for an extracted frame; unused until frame extraction lands.
+    source_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), ForeignKey("media_assets.id", ondelete="CASCADE"), nullable=True
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # plan | journal_video | frame
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # image | video | other
+    storage_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Video analysis (role == 'journal_video'). See analysis.py.
+    analysis_status: Mapped[str] = mapped_column(
+        String(12), default="pending", server_default="pending", nullable=False
+    )  # pending | analyzing | ready | failed
+    stage_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    equipment_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="assets")
+    entry: Mapped["JournalEntry | None"] = relationship(back_populates="media")
+    # NOTE: extracted frames (role == 'frame', source_asset_id set) are not
+    # produced yet; no relationship until frame extraction is implemented.

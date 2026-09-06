@@ -1,9 +1,8 @@
 import { createContext, type ReactNode, useContext, useEffect, useMemo, useState } from 'react'
 import { authApi } from '../api/authApi'
+import { TOKEN_KEY } from '../api/client'
 import type { User } from '../api/types'
 import { hashPassword } from '../lib/hash'
-
-const TOKEN_KEY = 'csm.session.token'
 
 interface AuthContextValue {
   user: User | null

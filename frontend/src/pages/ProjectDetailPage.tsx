@@ -1,44 +1,72 @@
 import { ArrowLeft, Download, FileText, HardHat, Image as ImageIcon, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, Navigate, useParams } from 'react-router-dom'
-import { AiStageAnalysis } from '../components/AiStageAnalysis'
 import { FileDropZone } from '../components/FileDropZone'
 import { JournalEntryCard } from '../components/JournalEntryCard'
 import { EditableText } from '../components/EditableText'
-import { Field, PrimaryButton, TextInput } from '../components/ui'
+import { PrimaryButton } from '../components/ui'
 import { useAuth } from '../context/AuthContext'
 import { useProjects } from '../context/ProjectsContext'
-import { todayDateString } from '../lib/date'
 import { formatFileSize } from '../lib/files'
 
 export function ProjectDetailPage() {
   const { id } = useParams<{ id: string }>()
   const { user } = useAuth()
-  const { getProject, updateProject, setProjectPlan, addJournalEntry } = useProjects()
+  const { getProject, refreshProject, updateProject, setProjectPlan, addJournalEntry } = useProjects()
   const project = id ? getProject(id) : undefined
 
-  const [comment, setComment] = useState('')
-  const [entryDate, setEntryDate] = useState(todayDateString)
   const [mediaFiles, setMediaFiles] = useState<File[]>([])
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [entryError, setEntryError] = useState<string | null>(null)
+  const [planError, setPlanError] = useState<string | null>(null)
+  const [notFound, setNotFound] = useState(false)
+
+  useEffect(() => {
+    if (!id) return
+    refreshProject(id).catch(() => setNotFound(true))
+  }, [id, refreshProject])
+
+  if (notFound) {
+    return <Navigate to="/projects" replace />
+  }
 
   if (!project) {
-    return <Navigate to="/projects" replace />
+    return (
+      <div className="flex min-h-svh items-center justify-center text-site-400">
+        Загрузка объекта…
+      </div>
+    )
+  }
+
+  const entriesWithMedia = project.entries.filter((entry) => entry.media.length > 0)
+  const videos = entriesWithMedia.flatMap((entry) => entry.media)
+  const isAnalyzing = videos.length > 0 && !project.planStatus
+
+  const changePlan = (file: File | null) => {
+    setPlanError(null)
+    void setProjectPlan(project.id, file).catch((err) =>
+      setPlanError(err instanceof Error ? err.message : 'Не удалось загрузить план'),
+    )
   }
 
   const handleAddMedia = (files: File[]) => {
     setMediaFiles((prev) => [...prev, ...files])
   }
 
-  const handleSubmitEntry = (e: React.FormEvent) => {
+  const handleSubmitEntry = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!comment.trim() && mediaFiles.length === 0) return
-    addJournalEntry(project.id, comment, mediaFiles, entryDate, user?.username ?? 'Неизвестно')
-    setComment('')
-    setEntryDate(todayDateString())
-    setMediaFiles([])
+    if (mediaFiles.length === 0 || isSubmitting) return
+    setIsSubmitting(true)
+    setEntryError(null)
+    try {
+      await addJournalEntry(project.id, mediaFiles, user?.username ?? 'Неизвестно')
+      setMediaFiles([])
+    } catch (err) {
+      setEntryError(err instanceof Error ? err.message : 'Не удалось добавить видео')
+    } finally {
+      setIsSubmitting(false)
+    }
   }
-
-  const hasMedia = project.entries.some((entry) => entry.media.length > 0)
 
   return (
     <div className="min-h-svh">
@@ -72,7 +100,7 @@ export function ProjectDetailPage() {
             value={project.name}
             as="h1"
             className="font-display text-2xl font-bold text-site-100 sm:text-3xl"
-            onSave={(name) => updateProject(project.id, { name })}
+            onSave={(name) => void updateProject(project.id, { name }).catch(() => {})}
           />
           <EditableText
             value={project.description}
@@ -80,7 +108,7 @@ export function ProjectDetailPage() {
             multiline
             placeholder="Добавить описание объекта"
             className="mt-2 max-w-2xl text-site-400"
-            onSave={(description) => updateProject(project.id, { description })}
+            onSave={(description) => void updateProject(project.id, { description }).catch(() => {})}
           />
         </div>
 
@@ -115,7 +143,7 @@ export function ProjectDetailPage() {
                   </a>
                   <button
                     type="button"
-                    onClick={() => setProjectPlan(project.id, null)}
+                    onClick={() => changePlan(null)}
                     className="inline-flex items-center gap-1.5 rounded-lg border border-site-600 px-3 py-2 text-sm font-medium text-site-300 transition hover:border-red-500/50 hover:text-red-400"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -127,47 +155,54 @@ export function ProjectDetailPage() {
                 label="Загрузить план объекта"
                 hint="PDF или изображение"
                 accept="application/pdf,image/*"
-                onFiles={(files) => setProjectPlan(project.id, files[0])}
+                onFiles={(files) => changePlan(files[0])}
               />
+            )}
+          </div>
+          {planError && (
+            <p className="mt-3 rounded-lg border border-red-900/60 bg-red-950/40 px-3.5 py-2.5 text-sm text-red-300">
+              {planError}
+            </p>
+          )}
+        </section>
+
+        <section className="mt-10">
+          <h2 className="font-display text-lg font-semibold text-site-100">Состояние объекта по плану</h2>
+          <div className="mt-3 rounded-xl border border-site-700 bg-site-900/50 p-4">
+            {videos.length === 0 ? (
+              <p className="text-sm text-site-500">
+                Загрузите видео с объекта — по нему ИИ оценит текущее состояние строительства
+                относительно плана.
+              </p>
+            ) : isAnalyzing ? (
+              <p className="text-sm text-site-400">
+                Идёт анализ загруженного видео. Оценка состояния объекта появится, когда анализ
+                завершится.
+              </p>
+            ) : (
+              <>
+                <p className="whitespace-pre-line text-sm leading-relaxed text-site-300">
+                  {project.planStatus}
+                </p>
+                <p className="mt-3 text-xs text-site-500">
+                  Сформировано автоматически по результатам анализа загруженных видео
+                </p>
+              </>
             )}
           </div>
         </section>
 
-        <div className="mt-8">
-          <AiStageAnalysis hasMedia={hasMedia} />
-        </div>
-
         <section className="mt-10">
-          <h2 className="font-display text-lg font-semibold text-site-100">Журнал объекта</h2>
+          <h2 className="font-display text-lg font-semibold text-site-100">Видео объекта</h2>
 
           <form
             onSubmit={handleSubmitEntry}
             className="mt-3 flex flex-col gap-3 rounded-xl border border-site-700 bg-site-900/50 p-4"
           >
-            <Field label="Дата записи" htmlFor="entry-date">
-              <TextInput
-                id="entry-date"
-                type="date"
-                required
-                max={todayDateString()}
-                value={entryDate}
-                onChange={(e) => setEntryDate(e.target.value)}
-                className="w-auto"
-              />
-            </Field>
-
-            <textarea
-              value={comment}
-              onChange={(e) => setComment(e.target.value)}
-              rows={3}
-              placeholder="Что произошло на объекте? Комментарий к записи…"
-              className="w-full rounded-lg border border-site-600 bg-site-800/80 px-3.5 py-2.5 text-site-100 outline-none placeholder:text-site-500 transition focus:border-safety-400 focus:ring-2 focus:ring-safety-400/30"
-            />
-
             <FileDropZone
-              label="Прикрепить фото или видео"
+              label="Загрузить видео"
               hint="Можно выбрать несколько файлов"
-              accept="image/*,video/*"
+              accept="video/*"
               multiple
               onFiles={handleAddMedia}
             />
@@ -193,20 +228,28 @@ export function ProjectDetailPage() {
               </ul>
             )}
 
+            {entryError && (
+              <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3.5 py-2.5 text-sm text-red-300">
+                {entryError}
+              </p>
+            )}
+
             <div className="flex justify-end">
-              <PrimaryButton type="submit" disabled={!comment.trim() && mediaFiles.length === 0}>
-                Добавить запись
+              <PrimaryButton type="submit" isLoading={isSubmitting} disabled={mediaFiles.length === 0}>
+                Добавить видео
               </PrimaryButton>
             </div>
           </form>
 
           <div className="mt-6 flex flex-col gap-3">
-            {project.entries.length === 0 ? (
+            {entriesWithMedia.length === 0 ? (
               <p className="rounded-xl border border-dashed border-site-700 bg-site-900/30 px-4 py-8 text-center text-sm text-site-500">
-                Записей пока нет — добавьте первую выше
+                Видео пока нет — загрузите первое выше
               </p>
             ) : (
-              project.entries.map((entry) => <JournalEntryCard key={entry.id} entry={entry} />)
+              entriesWithMedia.map((entry) => (
+                <JournalEntryCard key={entry.id} entry={entry} projectId={project.id} />
+              ))
             )}
           </div>
         </section>

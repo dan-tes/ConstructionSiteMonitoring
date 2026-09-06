@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import uuid
+from datetime import date as date_type
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
+
+
+class CamelModel(BaseModel):
+    """Serialises to camelCase so responses match the frontend's TypeScript types."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, from_attributes=True)
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+class SaltRequest(BaseModel):
+    username: str
+
+
+class SaltResponse(BaseModel):
+    salt: str
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    salt: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class UserOut(CamelModel):
+    id: uuid.UUID
+    username: str
+    created_at: datetime
+
+
+class SessionOut(CamelModel):
+    token: str
+    user: UserOut
+    expires_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Projects & journal
+# ---------------------------------------------------------------------------
+class ProjectFileOut(CamelModel):
+    id: str
+    name: str
+    type: str
+    size: int
+    url: str
+    kind: str
+    insight: VideoInsightOut | None = None
+
+
+class VideoInsightOut(CamelModel):
+    """Backend neural-network analysis of an uploaded journal video."""
+
+    status: str  # pending | analyzing | ready | failed
+    stage_summary: str | None = None
+    equipment_summary: str | None = None
+    photos: list[ProjectFileOut] = []
+
+
+ProjectFileOut.model_rebuild()
+
+
+class JournalEntryOut(CamelModel):
+    id: uuid.UUID
+    comment: str
+    author: str
+    date: date_type
+    media: list[ProjectFileOut] = []
+
+
+class ProjectOut(CamelModel):
+    id: uuid.UUID
+    name: str
+    description: str
+    plan: ProjectFileOut | None = None
+    plan_status: str | None = None
+    entries: list[JournalEntryOut] = []
+    created_at: datetime
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=5000)
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=5000)
+
+
+# Journal entries are created via multipart/form-data (video files + author +
+# date), so their fields are parsed with fastapi.Form in the router rather than
+# a JSON body model.
