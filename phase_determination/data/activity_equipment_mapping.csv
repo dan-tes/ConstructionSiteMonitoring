@@ -1,0 +1,155 @@
+activity_name,equipment_class,equipment_description
+Backfilling,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Backfilling,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Backfilling,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Backfilling,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Beam Concrete,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Beam Concrete,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Beam Concrete,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Beam Concrete,concrete_mixer,Concrete mixer/ready-mix vehicle used to transport and continuously mix concrete before placement.
+Beam Concrete,pump_truck,Concrete pump truck used to transfer and place ready-mix concrete through a boom or pumping system.
+Beam Formwork,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Beam Formwork,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Beam Formwork,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Beam Reinforcement,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Beam Reinforcement,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Beam Reinforcement,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Blockwork,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Blockwork,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Blockwork,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Boundary Works,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Boundary Works,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Boundary Works,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Boundary Works,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Column Concrete,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Column Concrete,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Column Concrete,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Column Concrete,concrete_mixer,Concrete mixer/ready-mix vehicle used to transport and continuously mix concrete before placement.
+Column Concrete,pump_truck,Concrete pump truck used to transfer and place ready-mix concrete through a boom or pumping system.
+Column Formwork,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Column Formwork,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Column Formwork,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Column Reinforcement,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Column Reinforcement,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Column Reinforcement,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Compaction,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Compaction,roller,"Road roller/compactor used to compact soil, aggregate, sub-base, and road construction layers."
+Compaction,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Compaction,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Curing,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Curing,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Defect Rectification,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Defect Rectification,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Design Finalisation,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Dewatering,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Dewatering,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Dewatering,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Dewatering,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Doors and Windows,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Doors and Windows,vehicle_crane,Mobile truck-mounted or all-terrain crane used for lifting materials and equipment at different locations on the construction site.
+Doors and Windows,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Drainage,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Drainage,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Drainage,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Drainage,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Electrical Final Installation,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Electrical Final Installation,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Electrical Rough-in,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Electrical Rough-in,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Excavation,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Excavation,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Excavation,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Excavation,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+External Brickwork,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+External Brickwork,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+External Brickwork,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+External Plastering,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+External Plastering,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+False Ceiling,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+False Ceiling,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Final Commissioning,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Final Commissioning,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Fire Protection,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Fire Protection,vehicle_crane,Mobile truck-mounted or all-terrain crane used for lifting materials and equipment at different locations on the construction site.
+Fire Protection,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Flooring,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Flooring,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Footing Concrete,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Footing Concrete,concrete_mixer,Concrete mixer/ready-mix vehicle used to transport and continuously mix concrete before placement.
+Footing Concrete,pump_truck,Concrete pump truck used to transfer and place ready-mix concrete through a boom or pumping system.
+Footing Concrete,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Footing Concrete,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Footing Formwork,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Footing Formwork,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Footing Formwork,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Footing Formwork,vehicle_crane,Mobile truck-mounted or all-terrain crane used for lifting materials and equipment at different locations on the construction site.
+Footing Reinforcement,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Footing Reinforcement,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Footing Reinforcement,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Footing Reinforcement,vehicle_crane,Mobile truck-mounted or all-terrain crane used for lifting materials and equipment at different locations on the construction site.
+Foundation Waterproofing,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Foundation Waterproofing,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+HVAC Installation,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+HVAC Installation,vehicle_crane,Mobile truck-mounted or all-terrain crane used for lifting materials and equipment at different locations on the construction site.
+HVAC Installation,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+HVAC Installation,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Inspection,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Inspection,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Internal Brickwork,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Internal Brickwork,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Internal Plastering,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Internal Plastering,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Landscaping,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Landscaping,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Landscaping,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Landscaping,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Landscaping,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Mobilisation,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Mobilisation,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Mobilisation,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+PCC,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+PCC,concrete_mixer,Concrete mixer/ready-mix vehicle used to transport and continuously mix concrete before placement.
+PCC,pump_truck,Concrete pump truck used to transfer and place ready-mix concrete through a boom or pumping system.
+Painting,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Painting,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Permit Approval,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Plumbing Rough-in,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Plumbing Rough-in,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Procurement Planning,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Road Works,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Road Works,bulldozer,"Tracked earthmoving machine with a front blade used for clearing, pushing, spreading, and rough grading soil and materials."
+Road Works,roller,"Road roller/compactor used to compact soil, aggregate, sub-base, and road construction layers."
+Road Works,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Road Works,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Site Clearance,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Site Clearance,bulldozer,"Tracked earthmoving machine with a front blade used for clearing, pushing, spreading, and rough grading soil and materials."
+Site Clearance,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Site Clearance,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Site Clearance,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Slab Concrete,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Slab Concrete,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Slab Concrete,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Slab Concrete,concrete_mixer,Concrete mixer/ready-mix vehicle used to transport and continuously mix concrete before placement.
+Slab Concrete,pump_truck,Concrete pump truck used to transfer and place ready-mix concrete through a boom or pumping system.
+Slab Formwork,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Slab Formwork,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Slab Formwork,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Slab Reinforcement,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Slab Reinforcement,tower_crane,"Fixed tower crane used to lift and position heavy materials such as reinforcement, formwork, masonry materials, and structural elements."
+Slab Reinforcement,hanging_hook,"Suspended crane hook/load attachment visible below a lifting crane, used for material lifting and positioning."
+Soil Disposal,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Soil Disposal,excavator,"Hydraulic excavator used for digging, trenching, loading, site clearance, and other earthmoving operations."
+Soil Disposal,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Soil Disposal,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Survey and Setting Out,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Survey and Setting Out,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Temporary Access Road,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Temporary Access Road,bulldozer,"Tracked earthmoving machine with a front blade used for clearing, pushing, spreading, and rough grading soil and materials."
+Temporary Access Road,roller,"Road roller/compactor used to compact soil, aggregate, sub-base, and road construction layers."
+Temporary Access Road,loader,"Wheel loader used to load, move, and stockpile soil, aggregate, debris, and construction materials."
+Temporary Access Road,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Temporary Facilities,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Temporary Facilities,truck,"Site or tipper truck used to transport soil, construction materials, debris, and other loads around or away from the site."
+Temporary Facilities,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
+Testing,worker,"Construction workers and site personnel performing manual, supervisory, installation, finishing, and inspection tasks."
+Testing,other_vehicle,Other construction-related vehicle or mobile equipment not covered by the defined equipment classes.
