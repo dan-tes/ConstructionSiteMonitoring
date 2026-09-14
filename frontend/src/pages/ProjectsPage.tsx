@@ -5,29 +5,38 @@ import { Modal } from '../components/Modal'
 import { Field, GhostButton, PrimaryButton, TextInput } from '../components/ui'
 import { useAuth } from '../context/AuthContext'
 import { useProjects } from '../context/ProjectsContext'
-import { pluralizeRu } from '../lib/pluralize'
 
 export function ProjectsPage() {
   const { user, logout } = useAuth()
-  const { projects, createProject } = useProjects()
+  const { projects, loading, error, createProject } = useProjects()
   const navigate = useNavigate()
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [isCreating, setIsCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
 
   const handleLogout = async () => {
     await logout()
     navigate('/login', { replace: true })
   }
 
-  const handleCreate = (e: React.FormEvent) => {
+  const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!name.trim()) return
-    const project = createProject(name, description)
-    setIsModalOpen(false)
-    setName('')
-    setDescription('')
-    navigate(`/projects/${project.id}`)
+    if (!name.trim() || isCreating) return
+    setIsCreating(true)
+    setCreateError(null)
+    try {
+      const project = await createProject(name, description)
+      setIsModalOpen(false)
+      setName('')
+      setDescription('')
+      navigate(`/projects/${project.id}`)
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : 'Не удалось создать объект')
+    } finally {
+      setIsCreating(false)
+    }
   }
 
   return (
@@ -73,7 +82,15 @@ export function ProjectsPage() {
 
         <div className="hazard-stripes h-1 w-full rounded-full opacity-70" />
 
-        {projects.length === 0 ? (
+        {error && (
+          <div className="mt-6 rounded-lg border border-red-900/60 bg-red-950/40 px-3.5 py-2.5 text-sm text-red-300">
+            {error}
+          </div>
+        )}
+
+        {loading && projects.length === 0 ? (
+          <p className="mt-10 text-center text-sm text-site-500">Загрузка объектов…</p>
+        ) : projects.length === 0 ? (
           <div className="mt-10 flex flex-col items-center justify-center rounded-2xl border border-dashed border-site-700 bg-site-900/40 px-6 py-20 text-center">
             <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-site-800 text-safety-400">
               <Construction className="h-8 w-8" strokeWidth={1.75} />
@@ -102,10 +119,7 @@ export function ProjectsPage() {
                   {project.description || 'Без описания'}
                 </p>
                 <div className="mt-4 flex items-center justify-between text-xs text-site-500">
-                  <span>
-                    {project.entries.length}{' '}
-                    {pluralizeRu(project.entries.length, 'запись', 'записи', 'записей')} в журнале
-                  </span>
+                  <span>{project.entries.length} видео</span>
                   <span>{project.plan ? 'План загружен' : 'Плана нет'}</span>
                 </div>
               </Link>
@@ -137,11 +151,18 @@ export function ProjectsPage() {
                 className="w-full rounded-lg border border-site-600 bg-site-800/80 px-3.5 py-2.5 text-site-100 outline-none placeholder:text-site-500 transition focus:border-safety-400 focus:ring-2 focus:ring-safety-400/30"
               />
             </Field>
+            {createError && (
+              <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3.5 py-2.5 text-sm text-red-300">
+                {createError}
+              </p>
+            )}
             <div className="mt-2 flex justify-end gap-3">
               <GhostButton type="button" onClick={() => setIsModalOpen(false)}>
                 Отмена
               </GhostButton>
-              <PrimaryButton type="submit">Создать</PrimaryButton>
+              <PrimaryButton type="submit" isLoading={isCreating}>
+                Создать
+              </PrimaryButton>
             </div>
           </form>
         </Modal>

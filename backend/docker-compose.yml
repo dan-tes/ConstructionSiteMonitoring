@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: csm-postgres
+    environment:
+      POSTGRES_USER: csm
+      POSTGRES_PASSWORD: csm
+      POSTGRES_DB: csm
+    ports:
+      - "5432:5432"
+    volumes:
+      - csm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U csm -d csm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: .
+    container_name: csm-backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Inside the compose network Postgres is reachable as "db", not localhost.
+      DATABASE_URL: postgresql+asyncpg://csm:csm@db:5432/csm
+      SECRET_KEY: ${SECRET_KEY:-change-me-to-a-long-random-string}
+      SESSION_TTL_DAYS: "7"
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      # URL the browser uses to fetch uploaded files (see /files/{id}).
+      PUBLIC_BASE_URL: http://localhost:8000
+      MEDIA_ROOT: /app/media
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Live source for --reload. The venv lives at /opt/venv, so this mount
+      # (which brings in the host .venv at /app/.venv) does not affect it.
+      - .:/app
+      # Uploaded files persist here across container restarts.
+      - csm-media:/app/media
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+
+volumes:
+  csm-pgdata:
+  csm-media:

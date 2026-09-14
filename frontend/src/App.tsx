@@ -6,6 +6,7 @@ import { LoginPage } from './pages/LoginPage'
 import { ProjectDetailPage } from './pages/ProjectDetailPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { RegisterPage } from './pages/RegisterPage'
+import { VideoDetailPage } from './pages/VideoDetailPage'
 
 function App() {
   return (
@@ -42,6 +43,14 @@ function App() {
             element={
               <ProtectedRoute>
                 <ProjectDetailPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/projects/:id/videos/:videoId"
+            element={
+              <ProtectedRoute>
+                <VideoDetailPage />
               </ProtectedRoute>
             }
           />
