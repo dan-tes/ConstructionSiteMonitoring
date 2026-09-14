@@ -1,4 +1,4 @@
-import { ArrowLeft, Download, FileText, HardHat, Image as ImageIcon, Trash2 } from 'lucide-react'
+import { ArrowLeft, Download, FileSpreadsheet, HardHat, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useParams } from 'react-router-dom'
 import { FileDropZone } from '../components/FileDropZone'
@@ -121,11 +121,7 @@ export function ProjectDetailPage() {
               <div className="flex items-center justify-between gap-3 rounded-xl border border-site-700 bg-site-900/50 p-4">
                 <div className="flex min-w-0 items-center gap-3">
                   <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-site-800 text-safety-400">
-                    {project.plan.kind === 'image' ? (
-                      <ImageIcon className="h-5 w-5" />
-                    ) : (
-                      <FileText className="h-5 w-5" />
-                    )}
+                    <FileSpreadsheet className="h-5 w-5" />
                   </span>
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium text-site-100">{project.plan.name}</p>
@@ -153,8 +149,8 @@ export function ProjectDetailPage() {
             ) : (
               <FileDropZone
                 label="Загрузить план объекта"
-                hint="PDF или изображение"
-                accept="application/pdf,image/*"
+                hint="CSV или Excel-таблица (.csv, .xlsx, .xls)"
+                accept=".csv,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 onFiles={(files) => changePlan(files[0])}
               />
             )}

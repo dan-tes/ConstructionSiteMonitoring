@@ -22,6 +22,14 @@ VIDEO_EXTENSIONS = {
 IMAGE_EXTENSIONS = {
     "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "heic", "heif", "svg",
 }
+# Project plan is a schedule table (stages + dates), uploaded as CSV or Excel.
+TABLE_EXTENSIONS = {"csv", "xlsx", "xls"}
+TABLE_CONTENT_TYPES = {
+    "text/csv",
+    "application/csv",
+    "application/vnd.ms-excel",  # .xls
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+}
 
 
 def _extension(name: str) -> str:
@@ -30,6 +38,8 @@ def _extension(name: str) -> str:
 
 
 def guess_kind(name: str, content_type: str) -> str:
+    if content_type in TABLE_CONTENT_TYPES or _extension(name) in TABLE_EXTENSIONS:
+        return "table"
     if content_type.startswith("image/"):
         return "image"
     if content_type.startswith("video/"):
@@ -43,9 +53,7 @@ def guess_kind(name: str, content_type: str) -> str:
 
 
 def is_allowed_plan(name: str, content_type: str) -> bool:
-    if content_type == "application/pdf" or _extension(name) == "pdf":
-        return True
-    return guess_kind(name, content_type) == "image"
+    return guess_kind(name, content_type) == "table"
 
 
 async def save_upload(

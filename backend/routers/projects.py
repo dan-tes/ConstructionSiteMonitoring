@@ -111,7 +111,9 @@ async def upload_plan(
     project = await _get_owned_project(db, user, project_id)
     name = file.filename or "plan"
     if not is_allowed_plan(name, file.content_type or ""):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "План должен быть PDF или изображением")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "План должен быть в формате CSV или Excel (.csv, .xlsx, .xls)"
+        )
 
     existing = project.plan_asset
     if existing is not None:

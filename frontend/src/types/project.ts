@@ -4,7 +4,7 @@ export interface ProjectFile {
   type: string
   size: number
   url: string
-  kind: 'image' | 'video' | 'other'
+  kind: 'table' | 'image' | 'video' | 'other'
   /** Backend neural-network analysis, present only on uploaded videos. */
   insight?: VideoInsight
 }
