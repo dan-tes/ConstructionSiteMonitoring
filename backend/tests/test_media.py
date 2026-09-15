@@ -57,7 +57,8 @@ async def test_video_upload_runs_analysis_and_fills_plan_status(client, auth):
     assert len(media) == 1
     video_id = media[0]["id"]
 
-    # analysis_delay_seconds is 0 in tests, so the background task has completed.
+    # conftest fakes the broker so the whole vision→phase→delay chain runs
+    # in-process, synchronously — the background task has completed by now.
     got = (await client.get(f"/projects/{pid}/videos/{video_id}", headers=headers)).json()
     assert got["insight"]["status"] == "ready"
     assert got["insight"]["stageSummary"]

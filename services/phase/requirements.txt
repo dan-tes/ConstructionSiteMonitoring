@@ -1,0 +1,7 @@
+aio-pika>=10.0.1
+pydantic>=2.6
+pandas>=2.2
+numpy>=1.26
+sentence-transformers>=3.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.4

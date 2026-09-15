@@ -12,6 +12,8 @@ dependencies = [
     "pydantic-settings>=2.6",
     "bcrypt>=4.2",
     "python-multipart>=0.0.12",
+    "aio-pika>=10.0.1",
+    "openpyxl>=3.1.5",
 ]
 
 [dependency-groups]

@@ -2,10 +2,11 @@
 
 FastAPI + PostgreSQL API for authentication and construction-site projects with a
 video journal. Site plans and journal videos are uploaded and stored on disk;
-each uploaded video goes through a **stubbed** analysis pipeline that produces
-placeholder "neural network" text (construction stage per the plan, machinery in
-frame). Real frame extraction and a real model/RAG call are not implemented — see
-*Media storage* and *Video analysis* below.
+each uploaded video goes through a RabbitMQ-driven analysis pipeline
+(vision → phase → delay, real models — see `integrations/README.md`) that
+produces the construction stage and machinery summary shown in the journal.
+Real frame extraction is not implemented yet — see *Media storage* and
+*Video analysis* below.
 
 ## Stack
 
@@ -97,7 +98,7 @@ Auth errors use `{ "detail": { "code", "message" } }` with codes
 | `GET` | `/projects/{id}` | includes journal entries, plan and `planStatus` |
 | `PATCH` | `/projects/{id}` | `{ name?, description? }` |
 | `DELETE` | `/projects/{id}` | also deletes the project's files |
-| `POST` | `/projects/{id}/plan` | `multipart/form-data`, field `file` — PDF or image; replaces any existing plan |
+| `POST` | `/projects/{id}/plan` | `multipart/form-data`, field `file` — CSV/XLS/XLSX schedule table; replaces any existing plan; only `.xlsx` in the canonical format is actually parsed into `plan_stages`, see *Video analysis* |
 | `DELETE` | `/projects/{id}/plan` | |
 | `POST` | `/projects/{id}/entries` | `multipart/form-data`: `author`, `date` (`YYYY-MM-DD`), `comment?`, one or more `files` (videos) |
 | `GET` | `/projects/{id}/videos/{videoId}` | one video + its analysis `insight` (for polling) |
@@ -122,11 +123,32 @@ works.
 
 ## Video analysis
 
-`analysis.py` runs as a FastAPI background task per uploaded video:
-`pending` → `analyzing` → (`ANALYSIS_DELAY_SECONDS` wait) → `ready` / `failed`.
-It is a **stub**: `analysis._analyze()` returns hard-coded Russian placeholder
-text. To plug in a real model/RAG service, replace that function and keep its
-return shape `(stage_summary, equipment_summary)`.
+`analysis.py` kicks off a RabbitMQ-driven pipeline per uploaded video:
+`pending` → `analyzing` (publishes `vision.command`) → `ready` / `failed`, with
+`analyzing` moving forward as each of the vision/phase/delay services
+publishes its result and the backend's consumer publishes the next command.
+See `integrations/README.md` for the full topology and `integrations/broker.py`
+for the transport. The vision/phase/delay services themselves (`services/*/`)
+run real models — YOLOv8m detection, the trained phase classifier, an
+Earned-Schedule delay forecast — each with documented live-inference
+simplifications (see each `services/*/worker.py` docstring).
+
+Uploading a plan enables the phase/delay steps: it must be an `.xlsx`
+workbook with a sheet in the canonical plan format — see
+`phase_determination/data/Требования_к_каноническому_формату_плана_v2.docx`
+for the full spec (21 fixed columns, one row per construction activity, same
+shape as `phase_determination/data/activities_with_equipment.csv`). Other
+sheets in the same workbook (equipment reference tables, etc.) are ignored;
+`plan_parser.py` looks for a sheet named like "plan"/"activities" and falls
+back to the first sheet otherwise. Notably the canonical format has no
+calendar dates (durations only — `planned_duration_days` per activity), so
+the delay forecast's one date anchor (`planned_start`) comes from the
+project's earliest journal entry instead (see `analysis.py`'s
+`_project_planned_start`).
+
+Parsing is deliberately strict (no fuzzy column matching, exactly one
+`project_id` per workbook); a plan that doesn't parse just means phase/delay
+run without a schedule, not a failed analysis.
 
 When a video becomes `ready`, the project's `plan_status` is set to that (most
 recently analysed) video's `stage_summary`. Extracted frames (`photos`) are not

@@ -1,5 +1,8 @@
 import hashlib
+import json
+import uuid
 from collections.abc import AsyncGenerator
+from datetime import date, datetime, timezone
 
 import pytest
 import pytest_asyncio
@@ -9,7 +12,66 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import analysis
 from config import settings
 from database import Base, get_db
+from integrations import broker
+from integrations.schemas import (
+    DelayForecastResult,
+    DetectResult,
+    Envelope,
+    EquipmentEvent,
+    PhaseResult,
+)
 from main import app
+
+
+async def _fake_publish(routing_key: str, body: bytes) -> None:
+    """Stands in for RabbitMQ + the vision/phase/delay services in tests:
+    routes a command straight to a canned result and feeds it back into the
+    matching analysis.handle_*_result, in-process. Keeps the pipeline's
+    orchestration logic (analysis.py) under test without a running broker or
+    workers — see integrations/README.md for the real topology this mocks."""
+    correlation_id = uuid.UUID(json.loads(body)["correlation_id"])
+
+    if routing_key == broker.VISION_COMMAND:
+        result = DetectResult(
+            status="done",
+            events=[
+                EquipmentEvent(
+                    track_id=1,
+                    equipment_class="excavator",
+                    event="arrival",
+                    at=datetime.now(timezone.utc),
+                )
+            ],
+        )
+        await analysis.handle_vision_result(
+            Envelope(
+                correlation_id=correlation_id,
+                published_at=datetime.now(timezone.utc),
+                payload=result,
+            )
+        )
+    elif routing_key == broker.PHASE_COMMAND:
+        result = PhaseResult(status="done", phase_name="Earthwork", confidence=0.9)
+        await analysis.handle_phase_result(
+            Envelope(
+                correlation_id=correlation_id,
+                published_at=datetime.now(timezone.utc),
+                payload=result,
+            )
+        )
+    elif routing_key == broker.DELAY_COMMAND:
+        result = DelayForecastResult(
+            status="done", delay_days=2, expected_completion=date.today(), confidence=0.8
+        )
+        await analysis.handle_delay_result(
+            Envelope(
+                correlation_id=correlation_id,
+                published_at=datetime.now(timezone.utc),
+                payload=result,
+            )
+        )
+    else:
+        raise AssertionError(f"unexpected routing key in test: {routing_key}")
 
 
 @pytest_asyncio.fixture
@@ -24,12 +86,14 @@ async def client(tmp_path, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
         async with testing_session() as session:
             yield session
 
-    # Uploads go to a throwaway dir; the analysis pipeline runs synchronously
-    # (no delay) so background tasks finish before the request returns.
+    # Uploads go to a throwaway dir.
     monkeypatch.setattr(settings, "media_root", tmp_path / "media")
-    monkeypatch.setattr(settings, "analysis_delay_seconds", 0.0)
     # analysis.run_analysis opens its own SessionLocal(); point it at the test DB.
     monkeypatch.setattr(analysis, "SessionLocal", testing_session)
+    # No RabbitMQ (or vision/phase/delay services) in tests — _fake_publish
+    # drives the same handle_*_result chain in-process, synchronously, so the
+    # background task is still fully done by the time the request returns.
+    monkeypatch.setattr(broker, "publish", _fake_publish)
 
     app.dependency_overrides[get_db] = override_get_db
     transport = ASGITransport(app=app)

@@ -1,0 +1,8 @@
+aio-pika>=10.0.1
+pydantic>=2.6
+opencv-python-headless>=4.10
+lap>=0.5.12
+requests>=2.32
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.4
+ultralytics>=8.3

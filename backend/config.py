@@ -18,10 +18,17 @@ class Settings(BaseSettings):
     # Base URL the browser can reach this API on; used to build file URLs
     # ({public_base_url}/files/{asset_id}) returned in responses.
     public_base_url: str = "http://localhost:8000"
+    # Base URL the vision service (a different container) reaches this API
+    # on to download the uploaded video — not the same as public_base_url,
+    # which is only reachable from the host/browser. In docker-compose this
+    # is http://backend:8000; defaults to public_base_url for local dev
+    # where everything runs on localhost.
+    internal_base_url: str | None = None
     # Hard limit for a single uploaded file.
     max_upload_mb: int = 200
-    # Stubbed "processing time" for the video analysis pipeline (see analysis.py).
-    analysis_delay_seconds: float = 8.0
+    # RabbitMQ broker the vision/phase/delay pipeline runs over (see
+    # integrations/README.md and integrations/broker.py).
+    rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
     cors_origins: Annotated[list[str], NoDecode] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
@@ -44,7 +51,7 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("public_base_url", mode="before")
+    @field_validator("public_base_url", "internal_base_url", mode="before")
     @classmethod
     def _strip_trailing_slash(cls, value: object) -> object:
         if isinstance(value, str):
@@ -54,6 +61,10 @@ class Settings(BaseSettings):
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def internal_url(self) -> str:
+        return self.internal_base_url or self.public_base_url
 
 
 @lru_cache
