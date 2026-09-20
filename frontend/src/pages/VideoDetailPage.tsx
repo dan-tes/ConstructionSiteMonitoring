@@ -19,6 +19,7 @@ export function VideoDetailPage() {
 
   const entry = project?.entries.find((e) => e.media.some((m) => m.id === videoId))
   const video = entry?.media.find((m) => m.id === videoId)
+  const isImage = video?.kind === 'image'
   const insight = video?.insight
   const status = insight?.status
   const isReady = status === 'ready'
@@ -74,7 +75,7 @@ export function VideoDetailPage() {
 
         {!video ? (
           <p className="mt-8 rounded-xl border border-dashed border-site-700 bg-site-900/30 px-4 py-10 text-center text-sm text-site-500">
-            Видео не найдено — возможно, оно было удалено.
+            Файл не найден — возможно, он был удалён.
           </p>
         ) : (
           <>
@@ -85,19 +86,28 @@ export function VideoDetailPage() {
 
             <div className="hazard-stripes mt-6 h-1 w-full rounded-full opacity-70" />
 
-            <video
-              src={video.url}
-              controls
-              className="mt-6 w-full rounded-xl border border-site-700 bg-black"
-            />
+            {isImage ? (
+              <img
+                src={video.url}
+                alt={video.name}
+                className="mt-6 w-full rounded-xl border border-site-700 bg-black object-contain"
+              />
+            ) : (
+              <video
+                src={video.url}
+                controls
+                className="mt-6 w-full rounded-xl border border-site-700 bg-black"
+              />
+            )}
 
             {isFailed ? (
               <div className="mt-8 rounded-2xl border border-red-900/60 bg-red-950/30 p-5">
                 <h2 className="font-display text-lg font-semibold text-site-100">
-                  Не удалось проанализировать видео
+                  Не удалось проанализировать {isImage ? 'фото' : 'видео'}
                 </h2>
                 <p className="mt-2 text-sm leading-relaxed text-site-400">
-                  Нейросеть не смогла обработать этот файл. Попробуйте загрузить видео ещё раз.
+                  Нейросеть не смогла обработать этот файл. Попробуйте загрузить{' '}
+                  {isImage ? 'фото' : 'видео'} ещё раз.
                 </p>
               </div>
             ) : !isReady ? (
@@ -105,10 +115,10 @@ export function VideoDetailPage() {
                 <Loader2 className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-safety-400" />
                 <div>
                   <h2 className="font-display text-lg font-semibold text-site-100">
-                    Видео анализируется
+                    {isImage ? 'Фото анализируется' : 'Видео анализируется'}
                   </h2>
                   <p className="mt-2 text-sm leading-relaxed text-site-400">
-                    Нейросеть обрабатывает это видео. Пока анализ не завершён, сказать что-либо об
+                    Нейросеть обрабатывает этот файл. Пока анализ не завершён, сказать что-либо об
                     этапе строительства, технике в кадре или зафиксированных событиях невозможно —
                     результаты появятся на этой странице автоматически.
                   </p>
@@ -173,7 +183,7 @@ export function VideoDetailPage() {
                 )}
 
                 <p className="mt-4 text-xs text-site-500">
-                  Оценка сформирована нейросетью по этому видео
+                  Оценка сформирована нейросетью по этому {isImage ? 'фото' : 'видео'}
                 </p>
               </>
             )}

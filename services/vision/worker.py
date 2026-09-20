@@ -5,7 +5,13 @@ a result, publishes it on `vision.result`. See
 backend/integrations/README.md for the pipeline topology this is one leg of.
 
 REAL detector: YOLOv8m pretrained on COCO (weights/yolov8m.pt, same file as
-cv/yolov8m.pt) with ByteTrack, run over the video at `command.video_url`.
+cv/yolov8m.pt), run over the file at `command.media_url`. Video
+(`command.kind == "video"`) gets full ByteTrack tracking, one "arrival" event
+per track. A single photo (`command.kind == "image"`) has no motion to
+track, so it's one detection pass over that frame — every box above the
+confidence threshold is its own "arrival" event, tagged with a per-detection
+index instead of a tracker id (there's nothing to track across frames of a
+single photo).
 Known limitation, same one noted in cv/a.ipynb: COCO's classes only overlap
 the MOCS equipment set (see schemas.EquipmentClass) on "truck" and "person"
 ("worker") — nothing else the model can see (excavator, crane, bulldozer,
@@ -49,24 +55,36 @@ COMMAND_ROUTING_KEY = "vision.command"
 RESULT_ROUTING_KEY = "vision.result"
 COMMAND_QUEUE = "vision.command.q"
 
-WEIGHTS_PATH = Path(__file__).parent / "weights" / "yolov8m.pt"
-CONF_THRESHOLD = 0.35
+WEIGHTS_PATH = Path(__file__).parent / "weights" / "best.pt"
+CONF_THRESHOLD = 0.1
 TRACKER_CONFIG = "bytetrack.yaml"
 
 COCO_TO_EQUIPMENT: dict[str, str] = {
     "truck": "truck",
-    "person": "worker",
+    "worker": "worker",
+    "tower_crane" :"tower_crane",
+    "hanging_hook" : "hanging_hook",
+    "vehicle_crane" : "vehicle_crane",
+    "roller" : "roller",
+    "bulldozer" : "bulldozer",
+    "excavator" : "excavator",
+    "truck" : "truck",
+    "loader" : "loader",
+    "pump_truck" : "pump_truck",
+    "concrete_mixer" : "concrete_mixer",
+    "pile_driver" : "pile_driver",
+    "other_vehicle" : "other_vehicle",
 }
 
 log.info("loading detector weights from %s", WEIGHTS_PATH)
 _model = YOLO(str(WEIGHTS_PATH))
 
 
-def _download(video_url: str) -> Path:
-    fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+def _download(media_url: str, *, suffix: str) -> Path:
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     path = Path(tmp_path)
-    with requests.get(video_url, stream=True, timeout=60) as resp:
+    with requests.get(media_url, stream=True, timeout=60) as resp:
         resp.raise_for_status()
         with path.open("wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -128,13 +146,52 @@ def _detect(video_path: Path, recorded_at: datetime) -> list[EquipmentEvent]:
     return events
 
 
+def _detect_photo(image_path: Path, recorded_at: datetime) -> list[EquipmentEvent]:
+    events: list[EquipmentEvent] = []
+    results = _model(str(image_path), conf=CONF_THRESHOLD, verbose=False)
+    result = results[0]
+    if result.boxes is None:
+        return events
+
+    for detection_id, box in enumerate(result.boxes):
+        class_name = _model.names[int(box.cls[0])]
+        equipment_class = COCO_TO_EQUIPMENT.get(class_name)
+        if equipment_class is None:
+            continue
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+        conf = float(box.conf[0]) if box.conf is not None else None
+        log.info(
+            "found %s (detection %d) at box center (%.0f, %.0f), conf %.2f",
+            equipment_class,
+            detection_id,
+            center_x,
+            center_y,
+            conf if conf is not None else float("nan"),
+        )
+        events.append(
+            EquipmentEvent(
+                track_id=detection_id,
+                equipment_class=equipment_class,
+                event="arrival",
+                at=recorded_at,
+            )
+        )
+    return events
+
+
 def compute(command: DetectCommand) -> DetectResult:  # EXTENSION POINT
-    log.info("detecting equipment for asset %s (%s)", command.asset_id, command.video_url)
-    video_path = _download(command.video_url)
+    log.info(
+        "detecting equipment for asset %s (%s, %s)", command.asset_id, command.kind, command.media_url
+    )
+    media_path = _download(command.media_url, suffix=".mp4" if command.kind == "video" else ".jpg")
     try:
-        events = _detect(video_path, command.recorded_at)
+        if command.kind == "video":
+            events = _detect(media_path, command.recorded_at)
+        else:
+            events = _detect_photo(media_path, command.recorded_at)
     finally:
-        video_path.unlink(missing_ok=True)
+        media_path.unlink(missing_ok=True)
 
     by_class = Counter(e.equipment_class for e in events)
     summary = ", ".join(f"{cls}: {n}" for cls, n in sorted(by_class.items())) or "none"
@@ -144,6 +201,7 @@ def compute(command: DetectCommand) -> DetectResult:  # EXTENSION POINT
         len(events),
         summary,
     )
+    log.info(DetectResult(status="done", events=events))
     return DetectResult(status="done", events=events)
 
 

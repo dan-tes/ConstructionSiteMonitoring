@@ -18,20 +18,42 @@ from integrations.schemas import (
     DetectResult,
     Envelope,
     EquipmentEvent,
+    NormalizedPhase,
     PhaseResult,
+    PlanNormalizeResult,
 )
 from main import app
 
 
 async def _fake_publish(routing_key: str, body: bytes) -> None:
-    """Stands in for RabbitMQ + the vision/phase/delay services in tests:
-    routes a command straight to a canned result and feeds it back into the
-    matching analysis.handle_*_result, in-process. Keeps the pipeline's
-    orchestration logic (analysis.py) under test without a running broker or
-    workers — see integrations/README.md for the real topology this mocks."""
+    """Stands in for RabbitMQ + the planner/vision/phase/delay services in
+    tests: routes a command straight to a canned result and feeds it back
+    into the matching analysis.handle_*_result, in-process. Keeps the
+    pipeline's orchestration logic (analysis.py) under test without a
+    running broker or workers — see integrations/README.md for the real
+    topology this mocks."""
     correlation_id = uuid.UUID(json.loads(body)["correlation_id"])
 
-    if routing_key == broker.VISION_COMMAND:
+    if routing_key == broker.PLAN_COMMAND:
+        result = PlanNormalizeResult(
+            status="done",
+            phases=[
+                NormalizedPhase(
+                    phase="Earthwork",
+                    planned_duration_days=30,
+                    expected_equipment=["worker", "excavator"],
+                )
+            ],
+            project_duration_days=120,
+        )
+        await analysis.handle_plan_result(
+            Envelope(
+                correlation_id=correlation_id,
+                published_at=datetime.now(timezone.utc),
+                payload=result,
+            )
+        )
+    elif routing_key == broker.VISION_COMMAND:
         result = DetectResult(
             status="done",
             events=[

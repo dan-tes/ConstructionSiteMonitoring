@@ -1,3 +1,15 @@
+import io
+import uuid
+from datetime import datetime, timezone
+
+import openpyxl
+from sqlalchemy import select
+
+import analysis
+from integrations.schemas import Envelope, PlanNormalizeResult
+from models import PlanStage
+from plan_parser import CANONICAL_COLUMNS
+
 VIDEO = ("clip.mp4", b"\x00\x00\x00 ftypisom" + b"\x00" * 64, "video/mp4")
 
 
@@ -7,28 +19,179 @@ async def _project(client, headers) -> str:
     ).json()["id"]
 
 
+def _canonical_plan_xlsx(rows: list[dict]) -> bytes:
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "activities"
+    sheet.append(CANONICAL_COLUMNS)
+    for row in rows:
+        sheet.append([row[c] for c in CANONICAL_COLUMNS])
+    buf = io.BytesIO()
+    workbook.save(buf)
+    return buf.getvalue()
+
+
+async def _plan_stages(pid: str) -> list[PlanStage]:
+    async with analysis.SessionLocal() as db:
+        return (
+            (await db.execute(select(PlanStage).where(PlanStage.project_id == uuid.UUID(pid))))
+            .scalars()
+            .all()
+        )
+
+
 async def test_plan_upload_download_delete(client, auth):
+    _, headers = await auth()
+    pid = await _project(client, headers)
+
+    content = b"phase,duration_days\nEarthwork,30\n"
+    up = await client.post(
+        f"/projects/{pid}/plan",
+        headers=headers,
+        files=[("file", ("plan.csv", content, "text/csv"))],
+    )
+    assert up.status_code == 200
+    plan = up.json()
+    assert plan["kind"] == "table"
+    # This .csv isn't the canonical .xlsx shape, so upload_plan falls back to
+    # the planner's LLM normalization — conftest's fake broker runs that
+    # round trip in-process, synchronously, so it's already done here.
+    assert plan["insight"]["status"] == "ready"
+    assert len(await _plan_stages(pid)) == 1
+
+    project = (await client.get(f"/projects/{pid}", headers=headers)).json()
+    assert project["plan"]["id"] == plan["id"]
+    assert project["plan"]["insight"]["status"] == "ready"
+
+    served = await client.get(plan["url"].replace("http://localhost:8000", ""))
+    assert served.status_code == 200
+    assert served.content == content
+
+    assert (await client.delete(f"/projects/{pid}/plan", headers=headers)).status_code == 204
+    assert (await client.get(f"/projects/{pid}", headers=headers)).json()["plan"] is None
+    assert await _plan_stages(pid) == []
+
+
+async def test_canonical_plan_xlsx_skips_llm_fallback(client, auth):
+    _, headers = await auth()
+    pid = await _project(client, headers)
+
+    base = {
+        "project_id": pid,
+        "resource_type": "equipment",
+        "quantity": 1,
+        "unit_cost": 1,
+        "planned_cost": 1,
+        "criticality": 0.5,
+        "status": "Planned",
+        "critical_path": 1,
+        "critical_path_position": 1,
+        "project_network_duration": 100,
+        "predecessor_count": 0,
+        "successor_count": 0,
+        "split": "validation",
+        "expected_equipment": "['worker']",
+        "expected_equipment_descriptions": "{}",
+    }
+    content = _canonical_plan_xlsx(
+        [
+            {**base, "activity_id": "A1", "phase": "Preconstruction", "phase_order": 1,
+             "activity_sequence": 1, "activity_name": "Design", "planned_duration_days": 10},
+            {**base, "activity_id": "A2", "phase": "Earthwork", "phase_order": 3,
+             "activity_sequence": 1, "activity_name": "Excavation", "planned_duration_days": 20},
+        ]
+    )
+
+    up = await client.post(
+        f"/projects/{pid}/plan",
+        headers=headers,
+        files=[(
+            "file",
+            (
+                "plan.xlsx",
+                content,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        )],
+    )
+    assert up.status_code == 200
+    plan = up.json()
+    # Already canonical — parsed synchronously, no planner/LLM round trip.
+    assert plan["insight"]["status"] == "ready"
+
+    stages = {s.phase: s.planned_duration_days for s in await _plan_stages(pid)}
+    assert stages == {"Preconstruction": 10, "Earthwork": 20}
+
+
+async def test_canonical_plan_download_round_trips(client, auth):
     _, headers = await auth()
     pid = await _project(client, headers)
 
     up = await client.post(
         f"/projects/{pid}/plan",
         headers=headers,
-        files=[("file", ("plan.pdf", b"%PDF-1.4 fake plan", "application/pdf"))],
+        files=[("file", ("plan.csv", b"phase,duration_days\nEarthwork,30\n", "text/csv"))],
     )
-    assert up.status_code == 200
-    plan = up.json()
-    assert plan["kind"] == "other" or plan["type"] == "application/pdf"
+    assert up.json()["insight"]["status"] == "ready"
+
+    download = await client.get(f"/projects/{pid}/plan/canonical", headers=headers)
+    assert download.status_code == 200
+    assert download.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # Re-uploading the exported file should parse as canonical directly —
+    # no second LLM round trip, same phases/duration as before.
+    other_pid = await _project(client, headers)
+    reupload = await client.post(
+        f"/projects/{other_pid}/plan",
+        headers=headers,
+        files=[(
+            "file",
+            (
+                "plan_canonical.xlsx",
+                download.content,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+        )],
+    )
+    assert reupload.status_code == 200
+    assert reupload.json()["insight"]["status"] == "ready"
+    stages = {s.phase: s.planned_duration_days for s in await _plan_stages(other_pid)}
+    assert stages == {"Earthwork": 30}
+
+
+async def test_canonical_plan_download_404s_before_plan_ready(client, auth):
+    _, headers = await auth()
+    pid = await _project(client, headers)
+    assert (
+        await client.get(f"/projects/{pid}/plan/canonical", headers=headers)
+    ).status_code == 404
+
+
+async def test_plan_normalization_failure_marks_plan_failed(client, auth):
+    _, headers = await auth()
+    pid = await _project(client, headers)
+
+    up = await client.post(
+        f"/projects/{pid}/plan",
+        headers=headers,
+        files=[("file", ("plan.csv", b"phase,duration_days\nEarthwork,30\n", "text/csv"))],
+    )
+    plan_id = up.json()["id"]
+
+    # Simulate the planner service reporting a bad/unparseable model
+    # response instead of the canned success conftest's fake broker gave it.
+    await analysis.handle_plan_result(
+        Envelope(
+            correlation_id=uuid.UUID(plan_id),
+            published_at=datetime.now(timezone.utc),
+            payload=PlanNormalizeResult(status="failed", error="model returned invalid JSON"),
+        )
+    )
 
     project = (await client.get(f"/projects/{pid}", headers=headers)).json()
-    assert project["plan"]["id"] == plan["id"]
-
-    served = await client.get(plan["url"].replace("http://localhost:8000", ""))
-    assert served.status_code == 200
-    assert served.content == b"%PDF-1.4 fake plan"
-
-    assert (await client.delete(f"/projects/{pid}/plan", headers=headers)).status_code == 204
-    assert (await client.get(f"/projects/{pid}", headers=headers)).json()["plan"] is None
+    assert project["plan"]["insight"]["status"] == "failed"
 
 
 async def test_plan_rejects_non_document(client, auth):
@@ -72,14 +235,41 @@ async def test_video_upload_runs_analysis_and_fills_plan_status(client, auth):
     assert served.status_code == 200
 
 
-async def test_entry_rejects_non_video(client, auth):
+async def test_photo_upload_runs_analysis_and_fills_plan_status(client, auth):
+    username, headers = await auth()
+    pid = await _project(client, headers)
+
+    entry = await client.post(
+        f"/projects/{pid}/entries",
+        headers=headers,
+        data={"author": username, "date": "2026-09-01"},
+        files=[("files", ("photo.jpg", b"\xff\xd8\xff", "image/jpeg"))],
+    )
+    assert entry.status_code == 201
+    media = entry.json()["media"]
+    assert len(media) == 1
+    assert media[0]["kind"] == "image"
+    photo_id = media[0]["id"]
+
+    # conftest fakes the broker so the whole vision→phase→delay chain runs
+    # in-process, synchronously — the background task has completed by now.
+    got = (await client.get(f"/projects/{pid}/videos/{photo_id}", headers=headers)).json()
+    assert got["insight"]["status"] == "ready"
+    assert got["insight"]["stageSummary"]
+    assert got["insight"]["equipmentSummary"]
+
+    project = (await client.get(f"/projects/{pid}", headers=headers)).json()
+    assert project["planStatus"] == got["insight"]["stageSummary"]
+
+
+async def test_entry_rejects_non_media(client, auth):
     username, headers = await auth()
     pid = await _project(client, headers)
     bad = await client.post(
         f"/projects/{pid}/entries",
         headers=headers,
         data={"author": username, "date": "2026-09-01"},
-        files=[("files", ("photo.jpg", b"\xff\xd8\xff", "image/jpeg"))],
+        files=[("files", ("notes.txt", b"hello", "text/plain"))],
     )
     assert bad.status_code == 422
 

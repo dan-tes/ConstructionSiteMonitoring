@@ -40,8 +40,9 @@ class Envelope(BaseModel, Generic[PayloadT]):
 # ---------------------------------------------------------------------------
 class DetectCommand(BaseModel):
     asset_id: uuid.UUID
-    video_url: str  # {public_base_url}/files/{asset_id} — service fetches it itself
-    recorded_at: datetime  # wall-clock moment the video starts, to timestamp events against
+    media_url: str  # {public_base_url}/files/{asset_id} — service fetches it itself
+    kind: Literal["video", "image"]  # how to run detection — track a video, or a single frame
+    recorded_at: datetime  # wall-clock moment the video starts (or the photo was taken)
 
 
 # MOCS (Moving Objects on Construction Sites) detector classes.
@@ -91,6 +92,70 @@ class PlanPhaseIn(BaseModel):
     phase: str
     phase_order: int
     planned_duration_days: float
+
+
+# ---------------------------------------------------------------------------
+# Plan normalization — LLM fallback for block 1 (диаграмма: блок 1).
+# routing keys: plan.command / plan.result
+#
+# plan_parser.py only accepts an already-canonical workbook (exact 21-column
+# header) — most uploaded plans (an MS Project/Primavera/Excel export with
+# its own column names and work-item names) aren't in that shape. This is
+# the fallback for those: an LLM re-expresses the free-form plan onto the 10
+# canonical phases below, which were derived empirically (see
+# phase_determination/data/phase_equipment_reference.csv — phase → expected
+# equipment, presence rate and typical count, fed into the model's prompt as
+# a closed vocabulary instead of letting it invent phase names).
+# ---------------------------------------------------------------------------
+CANONICAL_PHASES: tuple[str, ...] = (
+    "Preconstruction",
+    "Site Preparation",
+    "Earthwork",
+    "Foundation",
+    "Structural Frame",
+    "Masonry",
+    "MEP",
+    "Finishing",
+    "External Works",
+    "Commissioning",
+)  # order is significant: index + 1 == PlanPhaseIn.phase_order. Keep in sync
+   # by hand with the CanonicalPhase Literal directly below and with
+   # services/planner/schemas.py's own copy of both.
+
+CanonicalPhase = Literal[
+    "Preconstruction",
+    "Site Preparation",
+    "Earthwork",
+    "Foundation",
+    "Structural Frame",
+    "Masonry",
+    "MEP",
+    "Finishing",
+    "External Works",
+    "Commissioning",
+]
+
+
+class PlanNormalizeCommand(BaseModel):
+    asset_id: uuid.UUID
+    plan_url: str  # {internal_url}/files/{asset_id} — service fetches it itself
+    original_name: str  # extension hint; plan_url alone carries none
+
+
+class NormalizedPhase(BaseModel):
+    phase: CanonicalPhase
+    planned_duration_days: float
+    expected_equipment: list[EquipmentClass] = []
+
+
+class PlanNormalizeResult(BaseModel):
+    status: Literal["done", "failed"]
+    phases: list[NormalizedPhase] | None = None
+    # Total project critical-path duration — the LLM's estimate of the same
+    # quantity plan_parser.py reads straight off project_network_duration in
+    # a canonical workbook. None only when status is "failed".
+    project_duration_days: float | None = None
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------

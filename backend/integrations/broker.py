@@ -22,6 +22,8 @@ log = logging.getLogger("csm.broker")
 EXCHANGE_NAME = "csm.analysis"
 
 # Routing keys.
+PLAN_COMMAND = "plan.command"
+PLAN_RESULT = "plan.result"
 VISION_COMMAND = "vision.command"
 VISION_RESULT = "vision.result"
 PHASE_COMMAND = "phase.command"
@@ -32,6 +34,8 @@ DELAY_RESULT = "delay.result"
 # Queue a given routing key is delivered to. Command queues are consumed by
 # the matching service; result queues are consumed by the backend.
 QUEUE_NAMES: dict[str, str] = {
+    PLAN_COMMAND: "plan.command.q",
+    PLAN_RESULT: "backend.plan.result.q",
     VISION_COMMAND: "vision.command.q",
     VISION_RESULT: "backend.vision.result.q",
     PHASE_COMMAND: "phase.command.q",

@@ -14,6 +14,44 @@ export function MediaGrid({
   return (
     <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
       {files.map((file) => {
+        // In the journal grid (getVideoHref set) every file — photo or video —
+        // has an analysis result behind it, so it links to the detail page.
+        if (getVideoHref) {
+          const isImage = file.kind === 'image'
+          const analyzing =
+            file.insight?.status === 'analyzing' || file.insight?.status === 'pending'
+          return (
+            <Link
+              key={file.id}
+              to={getVideoHref(file)}
+              className="group relative aspect-square overflow-hidden rounded-lg border border-site-700 bg-black transition hover:border-safety-400"
+            >
+              {isImage ? (
+                <img src={file.url} alt={file.name} className="h-full w-full object-cover" />
+              ) : (
+                <>
+                  <video
+                    src={file.url}
+                    muted
+                    preload="metadata"
+                    className="pointer-events-none h-full w-full object-cover"
+                  />
+                  <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30 transition group-hover:bg-black/20">
+                    <span className="flex h-9 w-9 items-center justify-center rounded-full bg-safety-500 text-site-950">
+                      <Play className="h-4 w-4 translate-x-0.5" fill="currentColor" />
+                    </span>
+                  </span>
+                </>
+              )}
+              {analyzing && (
+                <span className="pointer-events-none absolute inset-x-1 bottom-1 flex items-center justify-center gap-1 rounded-md bg-black/70 px-1.5 py-1 text-[11px] font-medium text-site-200">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Анализ
+                </span>
+              )}
+            </Link>
+          )
+        }
         if (file.kind === 'image') {
           return (
             <a
@@ -27,38 +65,7 @@ export function MediaGrid({
             </a>
           )
         }
-        // In the journal grid (getVideoHref set) every non-image item is a video,
-        // even if the browser failed to report a video MIME type.
-        if (file.kind === 'video' || getVideoHref) {
-          if (getVideoHref) {
-            const analyzing =
-              file.insight?.status === 'analyzing' || file.insight?.status === 'pending'
-            return (
-              <Link
-                key={file.id}
-                to={getVideoHref(file)}
-                className="group relative aspect-square overflow-hidden rounded-lg border border-site-700 bg-black transition hover:border-safety-400"
-              >
-                <video
-                  src={file.url}
-                  muted
-                  preload="metadata"
-                  className="pointer-events-none h-full w-full object-cover"
-                />
-                <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30 transition group-hover:bg-black/20">
-                  <span className="flex h-9 w-9 items-center justify-center rounded-full bg-safety-500 text-site-950">
-                    <Play className="h-4 w-4 translate-x-0.5" fill="currentColor" />
-                  </span>
-                </span>
-                {analyzing && (
-                  <span className="pointer-events-none absolute inset-x-1 bottom-1 flex items-center justify-center gap-1 rounded-md bg-black/70 px-1.5 py-1 text-[11px] font-medium text-site-200">
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    Анализ
-                  </span>
-                )}
-              </Link>
-            )
-          }
+        if (file.kind === 'video') {
           return (
             <video
               key={file.id}

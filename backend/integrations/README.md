@@ -16,22 +16,36 @@ would close the gap.
 
 ## Services
 
-Three services sit behind the backend, which is the pipeline's orchestrator
+Four services sit behind the backend, which is the pipeline's orchestrator
 (it decides what runs next; it never calls a service directly):
 
 | Service | Diagram block | Responsibility |
 | --- | --- | --- |
+| **planner** | 1 — план объекта (LLM fallback) | Given a free-form uploaded plan the canonical parser rejected, re-expresses it onto the 10 canonical phases via an LLM |
 | **vision** | 2 — детекция и трекинг | Runs YOLO over an uploaded video, tracks equipment, emits arrival/departure events |
 | **phase** | 3 — понять фазу проекта | Given the plan schedule + equipment events, decides the current construction phase |
 | **delay** | 4 — прогноз отставания | Given the plan schedule + current phase + today's date, forecasts schedule lag |
 
-Block 1 (canonical plan workbook → `plan_stages`, see `plan_parser.py`) parses
-the real canonical format — one `.xlsx` workbook, the activities table
-(phase_determination/data/
-Требования_к_каноническому_формату_плана_v2.docx) on one sheet, other sheets
-ignored — but only the "ideal, already-clean workbook" case: no fuzzy column
-matching, no GPT. Blocks 5/6 (GPT summaries) aren't started — see *Open
-items* below.
+Block 1 (uploaded plan → `plan_stages`) has two paths, both landing in the
+same `PlanStage` table (see `models.py`) so `analysis.py`'s `_load_plan`
+never needs to know which one a given project's plan took:
+
+- **Fast path** (`plan_parser.py`): the uploaded `.xlsx` is already the real
+  canonical format — a fixed 21-column activities table (see
+  phase_determination/data/
+  Требования_к_каноническому_формату_плана_v2.docx) — parsed synchronously,
+  in the `upload_plan` request itself, no fuzzy column matching.
+- **LLM fallback** (`planner` service, `plan.command`/`plan.result`): anything
+  that doesn't parse as canonical (any `.csv`/`.xls`, or an `.xlsx` with the
+  wrong shape) goes to an LLM instead, which re-expresses the free-form
+  plan's own phases/work items onto 10 empirically-derived canonical phases
+  (see `services/planner/data/phase_equipment_reference.csv` and that
+  service's module docstring). Unlike the fast path this is async — plan
+  upload returns immediately with the plan asset's `analysis_status` at
+  `"analyzing"`, same lifecycle as a video/photo, and the frontend polls for
+  `"ready"`/`"failed"`.
+
+Blocks 5/6 (GPT summaries) aren't started — see *Open items* below.
 
 ## Integration pattern
 
@@ -54,6 +68,9 @@ primitive, so every step — slow or fast — looks the same on the wire.
                     │   Exchange: csm.analysis   │
                     │        (topic, durable)    │
                     └───────────────────────────┘
+   backend  ──plan.command───▶  plan.command.q     ──▶ planner service
+   backend  ◀──plan.result───   backend.plan.result.q   ◀── planner service
+
    backend  ──vision.command──▶  vision.command.q   ──▶ vision service
    backend  ◀──vision.result──   backend.vision.result.q  ◀── vision service
 
@@ -64,9 +81,16 @@ primitive, so every step — slow or fast — looks the same on the wire.
    backend  ◀──delay.result──   backend.delay.result.q   ◀── delay service
 ```
 
-`run_analysis()` in `analysis.py` becomes a choreography driven by result
-messages rather than a straight-line `await` chain: publish `vision.command`
-→ on `vision.result` persist events and publish `phase.command` → on
+`plan.command`/`plan.result` stand apart from the other three: they're not
+part of `run_analysis()`'s per-video choreography, but a one-off triggered
+from `upload_plan` (routers/projects.py) whenever the fast path
+(`plan_parser.py`) can't parse what was uploaded. `handle_plan_result` in
+`analysis.py` persists the outcome to `PlanStage` the same way the fast path
+does, and that's the end of it — no further command follows.
+
+`run_analysis()` itself becomes a choreography driven by result messages
+rather than a straight-line `await` chain: publish `vision.command` → on
+`vision.result` persist events and publish `phase.command` → on
 `phase.result` persist the phase and publish `delay.command` → on
 `delay.result` persist the forecast and move on to GPT summaries (blocks
 5/6, TBD). Each stage transition happens in the backend's result consumer,
@@ -75,8 +99,9 @@ keyed by `correlation_id`.
 ### Topology
 
 - **Exchange**: `csm.analysis`, topic, durable.
-- **Routing keys**: `vision.command`, `vision.result`, `phase.command`,
-  `phase.result`, `delay.command`, `delay.result`.
+- **Routing keys**: `plan.command`, `plan.result`, `vision.command`,
+  `vision.result`, `phase.command`, `phase.result`, `delay.command`,
+  `delay.result`.
 - **Queues**: one per consumer — `vision.command.q` (bound to
   `vision.command`, consumed by the vision service), `backend.vision.result.q`
   (bound to `vision.result`, consumed by the backend), and the same pair for
@@ -176,12 +201,18 @@ same way `analysis_status = "failed"` works today, no separate error path.
   under-count elapsed time. A real `Project.planned_start_date` (or reading
   it from wherever the canonical plan's source system tracks it) is the
   fix; nothing in the canonical format carries it today.
-- Block 1 (`plan_parser.py`): `.xlsx` only, exact canonical 21-column header
-  (`is_allowed_plan` in `media.py` accepts `.csv`/`.xls` too, but those
-  aren't parsed — the canonical format needs multiple sheets, which only
-  `.xlsx` gives us), no fuzzy column matching, no GPT-assisted parsing of an
-  arbitrary plan document. Exactly one `project_id` per workbook is
-  required — no support yet for a plan upload covering multiple projects.
+- Block 1 fast path (`plan_parser.py`): `.xlsx` only, exact canonical
+  21-column header, no fuzzy column matching. Exactly one `project_id` per
+  workbook is required — no support yet for a plan upload covering multiple
+  projects.
+- Block 1 LLM fallback (`services/planner`): only handles a *table* upload
+  (`.csv`/`.xlsx`/`.xls` — what `is_allowed_plan` in `media.py` already
+  restricts to), not an arbitrary document like a PDF or a scanned image of
+  a Gantt chart; there's no OCR/document-layout step. A row cap
+  (`MAX_SOURCE_ROWS`) truncates an unusually large source table rather than
+  chunking it, so a plan with far more than 500 line items loses whatever's
+  past the cut. No retry/self-correction loop on a malformed model
+  response — one bad JSON response is one `failed` result, not a re-prompt.
 - Blocks 5/6: GPT contracts for the per-video report and the project-level
   status summary — likely in-process calls (already outside the broker
   pipeline, since nothing calls them as a service), but not yet specced.

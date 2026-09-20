@@ -8,31 +8,34 @@ full topology): each `handle_*_result` below is registered as a consumer
 its step's output and publishes the next command. The final step
 (`handle_delay_result`) marks the asset `ready`.
 
-`plan_stages` comes from the project's uploaded canonical plan workbook, read
-fresh from disk on each step (see `_load_plan` / `plan_parser.py`) —
-block 1 parses the real canonical format (phase_determination/data/
-Требования_к_каноническому_формату_плана_v2.docx), but only the "ideal,
-already-clean workbook" case, not arbitrary plan documents. No plan uploaded
-(or it doesn't parse) just means phase/delay run with an empty schedule. The
-canonical format carries no calendar dates, so `planned_start` (the delay
-forecast's one date anchor) comes from the project's earliest journal entry
-instead — see `_project_planned_start`.
+`plan_stages` comes from `models.PlanStage`, populated once at plan-upload
+time (see `routers/projects.py`'s `upload_plan`) rather than re-read from
+disk on every analysis step: an already-canonical workbook is parsed
+synchronously right there (`plan_parser.py`); anything else is normalized by
+the `planner` service's LLM fallback, whose result `handle_plan_result`
+below persists the same way. No plan uploaded (or nothing persisted yet for
+it) just means phase/delay run with an empty schedule. The canonical format
+carries no calendar dates, so `planned_start` (the delay forecast's one date
+anchor) comes from the project's earliest journal entry instead — see
+`_project_planned_start`.
 
 vision/phase/delay (see `services/*/worker.py`) run real models now: YOLOv8m
-+ ByteTrack for vision, the trained ConstructionPhaseModel for phase, the
-Earned-Schedule forecast for delay — see each worker's module docstring for
-what's faithful to training and what's a live-inference simplification.
++ ByteTrack for video, single-frame YOLOv8m detection for photos, the
+trained ConstructionPhaseModel for phase, the Earned-Schedule forecast for
+delay — see each worker's module docstring for what's faithful to training
+and what's a live-inference simplification.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 if TYPE_CHECKING:
     from fastapi import BackgroundTasks
@@ -41,6 +44,7 @@ from config import settings
 from database import SessionLocal
 from integrations import broker
 from integrations.schemas import (
+    CANONICAL_PHASES,
     DelayForecastCommand,
     DelayForecastResult,
     DetectCommand,
@@ -49,9 +53,11 @@ from integrations.schemas import (
     EquipmentEvent,
     PhaseCommand,
     PhaseResult,
+    PlanNormalizeResult,
+    PlanPhaseIn,
 )
-from models import JournalEntry, MediaAsset, Project
-from plan_parser import ParsedPlan, PlanParseError, parse_plan_workbook
+from models import JournalEntry, MediaAsset, PlanStage, Project
+from plan_parser import ParsedPlan
 
 log = logging.getLogger("csm.analysis")
 
@@ -87,28 +93,28 @@ def _summarize_delay(stage_summary: str | None, result: DelayForecastResult) -> 
 
 
 async def _load_plan(db, project_id: uuid.UUID) -> ParsedPlan | None:
-    """Block 1 stand-in: read the project's uploaded canonical plan workbook,
-    if any. See plan_parser.py — assumes an ideal, already-clean workbook; a
-    missing plan or one that doesn't parse just means phase/delay run with
-    an empty schedule (None, not raised — a bad plan isn't an analysis
-    failure)."""
-    plan_asset = (
+    """The project's persisted plan schedule, if any (see `PlanStage` /
+    `handle_plan_result` below and `upload_plan` in routers/projects.py for
+    where these rows come from). No plan uploaded, or one still being
+    parsed/normalized, just means phase/delay run with an empty schedule
+    (None, not raised — a missing/pending plan isn't an analysis failure)."""
+    project = await db.get(Project, project_id)
+    if project is None or project.plan_duration_days is None:
+        return None
+    rows = (
         await db.execute(
-            select(MediaAsset).where(
-                MediaAsset.project_id == project_id, MediaAsset.role == "plan"
-            )
+            select(PlanStage)
+            .where(PlanStage.project_id == project_id)
+            .order_by(PlanStage.phase_order)
         )
-    ).scalar_one_or_none()
-    if plan_asset is None:
+    ).scalars().all()
+    if not rows:
         return None
-    if not plan_asset.original_name.lower().endswith(".xlsx"):
-        log.info("plan asset %s isn't an .xlsx workbook, skipping plan_stages", plan_asset.id)
-        return None
-    try:
-        return parse_plan_workbook(settings.media_root / plan_asset.storage_path)
-    except PlanParseError:
-        log.exception("failed to parse plan workbook for project %s", project_id)
-        return None
+    phases = [
+        PlanPhaseIn(phase=r.phase, phase_order=r.phase_order, planned_duration_days=r.planned_duration_days)
+        for r in rows
+    ]
+    return ParsedPlan(phases=phases, project_duration_days=project.plan_duration_days)
 
 
 async def _project_planned_start(db, project_id: uuid.UUID) -> date | None:
@@ -134,13 +140,14 @@ async def _mark_failed(asset_id: uuid.UUID, step: str, error: str | None) -> Non
 
 
 async def _refresh_plan_status(db, project_id: uuid.UUID) -> None:
-    """Project-level summary = stage summary of the most recently analysed video."""
+    """Project-level summary = stage summary of the most recently analysed
+    video or photo."""
     latest = (
         await db.execute(
             select(MediaAsset)
             .where(
                 MediaAsset.project_id == project_id,
-                MediaAsset.role == "journal_video",
+                MediaAsset.role.in_(("journal_video", "journal_photo")),
                 MediaAsset.analysis_status == "ready",
             )
             .order_by(MediaAsset.analyzed_at.desc())
@@ -152,20 +159,54 @@ async def _refresh_plan_status(db, project_id: uuid.UUID) -> None:
         project.plan_status = latest.stage_summary if latest else None
 
 
-async def run_analysis(asset_id: uuid.UUID) -> None:
-    """Kick off one journal video's analysis: mark it in-flight and publish
-    the first pipeline command. The rest happens in handle_*_result below,
-    driven by messages coming back from the vision/phase/delay services."""
+async def handle_plan_result(envelope: Envelope[PlanNormalizeResult]) -> None:
+    """Block 1's LLM fallback finishing: persist the normalized phases the
+    same way the canonical-workbook fast path does (see `upload_plan` in
+    routers/projects.py), so `_load_plan` never needs to know which path a
+    given project's plan took."""
+    asset_id = envelope.correlation_id
+    result = envelope.payload
+    if result.status == "failed" or not result.phases or result.project_duration_days is None:
+        await _mark_failed(asset_id, "plan", result.error)
+        return
+
     async with SessionLocal() as db:
         asset = await db.get(MediaAsset, asset_id)
-        if asset is None or asset.role != "journal_video":
+        if asset is None or asset.role != "plan":
+            return
+        project = await db.get(Project, asset.project_id)
+        await db.execute(delete(PlanStage).where(PlanStage.project_id == asset.project_id))
+        for phase in result.phases:
+            db.add(
+                PlanStage(
+                    project_id=asset.project_id,
+                    phase=phase.phase,
+                    phase_order=CANONICAL_PHASES.index(phase.phase) + 1,
+                    planned_duration_days=phase.planned_duration_days,
+                    expected_equipment=json.dumps(phase.expected_equipment),
+                )
+            )
+        project.plan_duration_days = result.project_duration_days
+        asset.analysis_status = "ready"
+        await db.commit()
+
+
+async def run_analysis(asset_id: uuid.UUID) -> None:
+    """Kick off one journal video's or photo's analysis: mark it in-flight and
+    publish the first pipeline command. The rest happens in handle_*_result
+    below, driven by messages coming back from the vision/phase/delay
+    services."""
+    async with SessionLocal() as db:
+        asset = await db.get(MediaAsset, asset_id)
+        if asset is None or asset.role not in ("journal_video", "journal_photo"):
             return
         asset.analysis_status = "analyzing"
         await db.commit()
 
     command = DetectCommand(
         asset_id=asset_id,
-        video_url=f"{settings.internal_url}/files/{asset_id}",
+        media_url=f"{settings.internal_url}/files/{asset_id}",
+        kind=asset.kind,
         recorded_at=datetime.now(timezone.utc),
     )
     body = _envelope(asset_id, command).model_dump_json().encode()
@@ -249,8 +290,11 @@ async def handle_delay_result(envelope: Envelope[DelayForecastResult]) -> None:
 
 
 async def start_consumers() -> None:
-    """Wire up the backend's three result consumers. Called once from
+    """Wire up the backend's four result consumers. Called once from
     main.py's lifespan on startup."""
+
+    async def _plan(body: bytes) -> None:
+        await handle_plan_result(Envelope[PlanNormalizeResult].model_validate_json(body))
 
     async def _vision(body: bytes) -> None:
         await handle_vision_result(Envelope[DetectResult].model_validate_json(body))
@@ -261,6 +305,7 @@ async def start_consumers() -> None:
     async def _delay(body: bytes) -> None:
         await handle_delay_result(Envelope[DelayForecastResult].model_validate_json(body))
 
+    await broker.start_consumer(broker.PLAN_RESULT, _plan)
     await broker.start_consumer(broker.VISION_RESULT, _vision)
     await broker.start_consumer(broker.PHASE_RESULT, _phase)
     await broker.start_consumer(broker.DELAY_RESULT, _delay)
@@ -277,7 +322,7 @@ async def requeue_pending() -> None:
         rows = (
             await db.execute(
                 select(MediaAsset.id).where(
-                    MediaAsset.role == "journal_video",
+                    MediaAsset.role.in_(("journal_video", "journal_photo")),
                     MediaAsset.analysis_status.in_(("pending", "analyzing")),
                 )
             )

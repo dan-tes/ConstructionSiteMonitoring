@@ -1,0 +1,52 @@
+phase_order,phase,equipment_class,tier,presence_pct,count_min,count_max
+1,Preconstruction,worker,core,100,2,20
+1,Preconstruction,truck,episodic,25,0,4
+1,Preconstruction,other_vehicle,episodic,25,0,2
+2,Site Preparation,worker,core,100,2,20
+2,Site Preparation,truck,core,75,0,4
+2,Site Preparation,bulldozer,typical,50,0,1
+2,Site Preparation,loader,typical,50,0,2
+2,Site Preparation,other_vehicle,typical,50,0,2
+2,Site Preparation,excavator,episodic,25,0,2
+2,Site Preparation,roller,episodic,25,0,1
+3,Earthwork,worker,core,100,2,20
+3,Earthwork,truck,core,100,0,4
+3,Earthwork,excavator,core,80,0,2
+3,Earthwork,loader,core,80,0,2
+3,Earthwork,roller,episodic,20,0,1
+3,Earthwork,other_vehicle,episodic,20,0,2
+4,Foundation,worker,core,100,2,20
+4,Foundation,tower_crane,core,60,0,2
+4,Foundation,hanging_hook,core,60,0,2
+4,Foundation,concrete_mixer,typical,40,0,3
+4,Foundation,pump_truck,typical,40,0,1
+4,Foundation,vehicle_crane,typical,40,0,1
+4,Foundation,other_vehicle,episodic,20,0,2
+5,Structural Frame,worker,core,100,2,20
+5,Structural Frame,tower_crane,core,90,0,2
+5,Structural Frame,hanging_hook,core,90,0,2
+5,Structural Frame,concrete_mixer,typical,30,0,3
+5,Structural Frame,pump_truck,typical,30,0,1
+5,Structural Frame,other_vehicle,episodic,10,0,2
+6,Masonry,worker,core,100,2,20
+6,Masonry,tower_crane,core,67,0,2
+6,Masonry,hanging_hook,core,67,0,2
+6,Masonry,other_vehicle,typical,33,0,2
+7,MEP,worker,core,100,2,20
+7,MEP,other_vehicle,core,80,0,2
+7,MEP,vehicle_crane,typical,40,0,1
+7,MEP,tower_crane,episodic,20,0,2
+7,MEP,hanging_hook,episodic,20,0,2
+8,Finishing,worker,core,100,2,20
+8,Finishing,other_vehicle,core,83,0,2
+8,Finishing,vehicle_crane,episodic,17,0,1
+8,Finishing,hanging_hook,episodic,17,0,2
+9,External Works,worker,core,100,2,20
+9,External Works,loader,core,100,0,2
+9,External Works,truck,core,100,0,4
+9,External Works,excavator,core,75,0,2
+9,External Works,other_vehicle,episodic,25,0,2
+9,External Works,bulldozer,episodic,25,0,1
+9,External Works,roller,episodic,25,0,1
+10,Commissioning,worker,core,100,2,20
+10,Commissioning,other_vehicle,core,100,0,2

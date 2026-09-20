@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, Uuid, func
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -56,6 +56,11 @@ class Project(Base):
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     # Project-level summary generated from the latest analysed video (see analysis.py).
     plan_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The uploaded plan's total critical-path duration (project_network_duration
+    # in the canonical format, or the LLM's estimate of the same quantity for a
+    # normalized plan — see plan_parser.py / PlanStage / integrations/schemas.py's
+    # PlanNormalizeResult). None until a plan has been parsed/normalized.
+    plan_duration_days: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -68,6 +73,11 @@ class Project(Base):
     )
     assets: Mapped[list["MediaAsset"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
+    )
+    plan_stages: Mapped[list["PlanStage"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="PlanStage.phase_order",
     )
 
     @property
@@ -115,7 +125,7 @@ class MediaAsset(Base):
     source_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(), ForeignKey("media_assets.id", ondelete="CASCADE"), nullable=True
     )
-    role: Mapped[str] = mapped_column(String(20), nullable=False)  # plan | journal_video | frame
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # plan | journal_video | journal_photo | frame
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(128), nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -125,7 +135,7 @@ class MediaAsset(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    # Video analysis (role == 'journal_video'). See analysis.py.
+    # Video/photo analysis (role in 'journal_video'/'journal_photo'). See analysis.py.
     analysis_status: Mapped[str] = mapped_column(
         String(12), default="pending", server_default="pending", nullable=False
     )  # pending | analyzing | ready | failed
@@ -137,3 +147,30 @@ class MediaAsset(Base):
     entry: Mapped["JournalEntry | None"] = relationship(back_populates="media")
     # NOTE: extracted frames (role == 'frame', source_asset_id set) are not
     # produced yet; no relationship until frame extraction is implemented.
+
+
+class PlanStage(Base):
+    """One canonical phase's planned duration for a project — block 1's
+    single stored output, regardless of whether it came from parsing an
+    already-canonical workbook (plan_parser.py) or from the LLM fallback
+    (integrations/schemas.py's PlanNormalizeResult, see analysis.py's
+    handle_plan_result). Read fresh from the uploaded file used to happen on
+    every analysis step (see analysis.py's old _load_plan); now parsed/
+    normalized once, at upload time, and persisted here instead."""
+
+    __tablename__ = "plan_stages"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    phase: Mapped[str] = mapped_column(String(100), nullable=False)
+    phase_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    planned_duration_days: Mapped[float] = mapped_column(Float, nullable=False)
+    # JSON-encoded list of EquipmentClass strings. Always "[]" for a
+    # canonical-workbook plan — plan_parser.py doesn't extract per-phase
+    # equipment today (see its module docstring) — populated for an
+    # LLM-normalized plan (NormalizedPhase.expected_equipment).
+    expected_equipment: Mapped[str] = mapped_column(Text, default="[]", server_default="[]", nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="plan_stages")

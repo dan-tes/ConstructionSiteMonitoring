@@ -1,0 +1,7 @@
+aio-pika>=10.0.1
+pydantic>=2.6
+httpx>=0.27
+openai>=1.50
+pandas>=2.2
+openpyxl>=3.1
+xlrd>=2.0

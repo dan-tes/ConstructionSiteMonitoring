@@ -26,7 +26,8 @@ class Envelope(BaseModel, Generic[PayloadT]):
 
 class DetectCommand(BaseModel):
     asset_id: uuid.UUID
-    video_url: str
+    media_url: str
+    kind: Literal["video", "image"]
     recorded_at: datetime
 
 
@@ -53,8 +54,20 @@ class EquipmentEvent(BaseModel):
     event: Literal["arrival", "departure"]
     at: datetime
 
+    def __str__(self):
+        return f'{self.track_id} : cl: {self.equipment_class}, at {self.at}, {self.event}'
+
+    def __repr__(self):
+        return self.__str__()
+
 
 class DetectResult(BaseModel):
     status: Literal["done", "failed"]
     events: list[EquipmentEvent] | None = None
     error: str | None = None
+
+    def __str__(self):
+        return str(self.status) + '\n'.join([str(i) for i in self.events])
+
+    def __repr__(self):
+        return self.__str__()
