@@ -26,8 +26,8 @@ class Envelope(BaseModel, Generic[PayloadT]):
 
 class DetectCommand(BaseModel):
     asset_id: uuid.UUID
-    video_url: str
-    recorded_at: datetime
+    media_url: str
+    kind: Literal["video", "image"]
 
 
 EquipmentClass = Literal[
@@ -47,14 +47,12 @@ EquipmentClass = Literal[
 ]
 
 
-class EquipmentEvent(BaseModel):
-    track_id: int
+class EquipmentCount(BaseModel):
     equipment_class: EquipmentClass
-    event: Literal["arrival", "departure"]
-    at: datetime
+    count: int
 
 
 class DetectResult(BaseModel):
     status: Literal["done", "failed"]
-    events: list[EquipmentEvent] | None = None
+    counts: list[EquipmentCount] | None = None
     error: str | None = None

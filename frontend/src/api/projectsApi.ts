@@ -1,5 +1,5 @@
 import type { JournalEntry, Project, ProjectFile } from '../types/project'
-import { request } from './client'
+import { request, requestBlob } from './client'
 
 export const projectsApi = {
   list(): Promise<Project[]> {
@@ -26,6 +26,14 @@ export const projectsApi = {
 
   deletePlan(id: string): Promise<void> {
     return request<void>(`/projects/${id}/plan`, { method: 'DELETE' })
+  },
+
+  /** The project's plan re-expressed in our canonical .xlsx format (see
+   * backend/plan_parser.py) — available once it's been parsed/normalized,
+   * regardless of whether the original upload already was canonical or
+   * needed the LLM fallback. */
+  downloadCanonicalPlan(id: string): Promise<Blob> {
+    return requestBlob(`/projects/${id}/plan/canonical`)
   },
 
   uploadVideos(

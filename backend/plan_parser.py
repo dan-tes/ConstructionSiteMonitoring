@@ -45,6 +45,7 @@ via `PlanParseError` instead of guessing.
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,3 +165,60 @@ def parse_plan_workbook(path: Path) -> ParsedPlan:
         for (order, phase), duration in sorted(phase_durations.items())
     ]
     return ParsedPlan(phases=phases, project_duration_days=next(iter(network_durations)))
+
+
+@dataclass
+class CanonicalExportPhase:
+    phase: str
+    phase_order: int
+    planned_duration_days: float
+    expected_equipment: list[str]
+
+
+def build_canonical_workbook(
+    project_id: str, phases: list[CanonicalExportPhase], project_duration_days: float
+) -> bytes:
+    """The write side of the canonical format: one `.xlsx` with the same
+    21-column header `parse_plan_workbook` reads, so re-uploading this file
+    round-trips cleanly through it. One synthetic activity row stands in for
+    each whole phase — `PlanStage` (see models.py) only ever has phase-level
+    durations, not the real per-activity breakdown a genuine canonical plan
+    has, whether the project's plan came from the fast path or the
+    `planner` service's LLM fallback. Lets a project be inspected/edited in
+    the canonical shape and re-uploaded, rather than only ever consumed
+    read-only.
+    """
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "activities"
+    sheet.append(CANONICAL_COLUMNS)
+    last = len(phases) - 1
+    for i, p in enumerate(phases):
+        sheet.append(
+            [
+                project_id,
+                f"{project_id}_P{p.phase_order:02d}",
+                p.phase,
+                p.phase_order,
+                1,  # activity_sequence — one synthetic activity per phase
+                p.phase,  # activity_name
+                "mixed",  # resource_type
+                p.planned_duration_days,
+                1,  # quantity
+                0,  # unit_cost
+                0,  # planned_cost
+                1.0,  # criticality — this row *is* the whole phase
+                "Planned",  # status
+                1,  # critical_path
+                p.phase_order,  # critical_path_position
+                project_duration_days,
+                0 if i == 0 else 1,  # predecessor_count
+                0 if i == last else 1,  # successor_count
+                "validation",  # split
+                repr(p.expected_equipment),
+                "{}",  # expected_equipment_descriptions — not tracked per-phase
+            ]
+        )
+    buf = io.BytesIO()
+    workbook.save(buf)
+    return buf.getvalue()

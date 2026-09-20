@@ -8,7 +8,6 @@ import {
   useState,
 } from 'react'
 import { projectsApi } from '../api/projectsApi'
-import { todayDateString } from '../lib/date'
 import { useAuth } from './AuthContext'
 import type { JournalEntry, Project, VideoInsight } from '../types/project'
 
@@ -23,7 +22,8 @@ interface ProjectsContextValue {
   createProject: (name: string, description: string) => Promise<Project>
   updateProject: (id: string, patch: { name?: string; description?: string }) => Promise<void>
   setProjectPlan: (id: string, file: File | null) => Promise<void>
-  addJournalEntry: (id: string, mediaFiles: File[], author: string) => Promise<void>
+  downloadCanonicalPlan: (id: string) => Promise<Blob>
+  addJournalEntry: (id: string, mediaFiles: File[], author: string, date: string) => Promise<void>
   /** Re-fetch one video's analysis and merge it in. Returns the new status. */
   refreshVideo: (projectId: string, videoId: string) => Promise<VideoInsight['status'] | undefined>
 }
@@ -108,6 +108,8 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const downloadCanonicalPlan = useCallback((id: string) => projectsApi.downloadCanonicalPlan(id), [])
+
   const patchVideo = useCallback((projectId: string, videoId: string, insight?: VideoInsight) => {
     setProjects((prev) =>
       prev.map((p) =>
@@ -158,13 +160,8 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
   )
 
   const addJournalEntry = useCallback(
-    async (id: string, mediaFiles: File[], author: string) => {
-      const entry: JournalEntry = await projectsApi.uploadVideos(
-        id,
-        mediaFiles,
-        author,
-        todayDateString(),
-      )
+    async (id: string, mediaFiles: File[], author: string, date: string) => {
+      const entry: JournalEntry = await projectsApi.uploadVideos(id, mediaFiles, author, date)
       setProjects((prev) =>
         prev.map((p) => (p.id === id ? { ...p, entries: [entry, ...p.entries] } : p)),
       )
@@ -184,6 +181,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     createProject,
     updateProject,
     setProjectPlan,
+    downloadCanonicalPlan,
     addJournalEntry,
     refreshVideo,
   }

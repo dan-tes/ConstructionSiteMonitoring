@@ -105,7 +105,7 @@ def file_url(asset_id: uuid.UUID) -> str:
 
 def asset_to_file_out(asset: MediaAsset, *, with_insight: bool = False) -> ProjectFileOut:
     insight = None
-    if with_insight and asset.role == "journal_video":
+    if with_insight and asset.role in ("journal_video", "journal_photo"):
         ready = asset.analysis_status == "ready"
         insight = VideoInsightOut(
             status=asset.analysis_status,
@@ -113,6 +113,14 @@ def asset_to_file_out(asset: MediaAsset, *, with_insight: bool = False) -> Proje
             equipment_summary=asset.equipment_summary if ready else None,
             photos=[],  # frame extraction not implemented yet
         )
+    elif with_insight and asset.role == "plan":
+        # Reused for the plan's own async step: canonical-workbook parsing is
+        # synchronous (status goes straight to "ready"/"failed" at upload
+        # time), but a plan that needed the LLM fallback sits at "analyzing"
+        # until the planner service's result comes back — see
+        # routers/projects.py's upload_plan and analysis.py's
+        # handle_plan_result.
+        insight = VideoInsightOut(status=asset.analysis_status)
     return ProjectFileOut(
         id=str(asset.id),
         name=asset.original_name,
@@ -140,7 +148,7 @@ def project_to_out(project: Project) -> ProjectOut:
         id=project.id,
         name=project.name,
         description=project.description,
-        plan=asset_to_file_out(plan) if plan else None,
+        plan=asset_to_file_out(plan, with_insight=True) if plan else None,
         plan_status=project.plan_status,
         entries=[entry_to_out(e) for e in project.entries],
         created_at=project.created_at,

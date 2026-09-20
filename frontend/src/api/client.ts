@@ -79,3 +79,23 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 
   return payload as T
 }
+
+/** Like `request`, but for a binary response (e.g. a generated .xlsx) that
+ * isn't JSON/text — callers turn the Blob into an object URL to trigger a
+ * download. */
+export async function requestBlob(path: string): Promise<Blob> {
+  const headers: Record<string, string> = {}
+  const bearer = getToken()
+  if (bearer) headers.Authorization = `Bearer ${bearer}`
+
+  let response: Response
+  try {
+    response = await fetch(`${API_URL}${path}`, { headers })
+  } catch {
+    throw new ApiError(0, 'Не удалось связаться с сервером. Проверьте подключение.')
+  }
+  if (!response.ok) {
+    throw new ApiError(response.status, `Ошибка запроса (${response.status})`)
+  }
+  return response.blob()
+}

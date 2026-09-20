@@ -1,12 +1,18 @@
+import json
+import logging
 import uuid
 from datetime import date as date_type
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import select
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Response, UploadFile, status
+from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
 from analysis import schedule_analysis
+from config import settings
 from deps import CurrentUser, DbSession
+from integrations import broker
+from integrations.schemas import Envelope, PlanNormalizeCommand
 from media import (
     asset_to_file_out,
     entry_to_out,
@@ -16,7 +22,8 @@ from media import (
     save_upload,
     unlink_asset_files,
 )
-from models import JournalEntry, MediaAsset, Project, User
+from models import JournalEntry, MediaAsset, PlanStage, Project, User
+from plan_parser import CanonicalExportPhase, PlanParseError, build_canonical_workbook, parse_plan_workbook
 from schemas import (
     JournalEntryOut,
     ProjectCreate,
@@ -25,9 +32,11 @@ from schemas import (
     ProjectUpdate,
 )
 
+log = logging.getLogger("csm.projects")
+
 router = APIRouter(prefix="/projects", tags=["projects"])
 
-MAX_VIDEOS_PER_ENTRY = 20
+MAX_FILES_PER_ENTRY = 20
 
 
 async def _get_owned_project(db: DbSession, user: User, project_id: uuid.UUID) -> Project:
@@ -99,8 +108,13 @@ async def delete_project(project_id: uuid.UUID, db: DbSession, user: CurrentUser
 
 
 # ---------------------------------------------------------------------------
-# Project plan (single file: PDF or image)
+# Project plan (schedule table: CSV or Excel)
 # ---------------------------------------------------------------------------
+async def _clear_plan_stages(db: DbSession, project: Project) -> None:
+    await db.execute(delete(PlanStage).where(PlanStage.project_id == project.id))
+    project.plan_duration_days = None
+
+
 @router.post("/{project_id}/plan", response_model=ProjectFileOut)
 async def upload_plan(
     project_id: uuid.UUID,
@@ -120,6 +134,7 @@ async def upload_plan(
         unlink_asset_files([existing])
         await db.delete(existing)
         await db.flush()
+    await _clear_plan_stages(db, project)
 
     asset_id = uuid.uuid4()
     storage_path, size = await save_upload(file, project_id, asset_id)
@@ -132,10 +147,58 @@ async def upload_plan(
         size=size,
         kind=guess_kind(name, file.content_type or ""),
         storage_path=storage_path,
+        analysis_status="pending",
     )
     db.add(asset)
-    await db.commit()
-    return asset_to_file_out(asset)
+    await db.flush()
+
+    # Fast path: the uploaded workbook is already in the canonical shape
+    # (plan_parser.py — exact 21-column .xlsx). Only .xlsx is worth trying;
+    # .csv/.xls can't carry the canonical format's multiple sheets (see
+    # integrations/README.md). Anything that doesn't fit falls back to the
+    # planner service's LLM normalization, same as .csv/.xls always do.
+    parsed = None
+    if name.lower().endswith(".xlsx"):
+        try:
+            parsed = parse_plan_workbook(settings.media_root / storage_path)
+        except PlanParseError:
+            log.info(
+                "plan %s isn't canonical-shaped, falling back to LLM normalization", asset_id
+            )
+
+    if parsed is not None:
+        project.plan_duration_days = parsed.project_duration_days
+        for p in parsed.phases:
+            db.add(
+                PlanStage(
+                    project_id=project_id,
+                    phase=p.phase,
+                    phase_order=p.phase_order,
+                    planned_duration_days=p.planned_duration_days,
+                )
+            )
+        asset.analysis_status = "ready"
+        await db.commit()
+    else:
+        asset.analysis_status = "analyzing"
+        await db.commit()
+        command = PlanNormalizeCommand(
+            asset_id=asset_id,
+            plan_url=f"{settings.internal_url}/files/{asset_id}",
+            original_name=name,
+        )
+        body = Envelope(
+            correlation_id=asset_id, published_at=datetime.now(timezone.utc), payload=command
+        ).model_dump_json().encode()
+        await broker.publish(broker.PLAN_COMMAND, body)
+        # In production this asset is still "analyzing" here — the planner
+        # service hasn't replied yet. In tests the fake broker (conftest.py)
+        # runs the whole plan.command/plan.result round trip synchronously,
+        # in a separate DB session, so this session's cached `asset` needs an
+        # explicit refresh to see whatever it left behind.
+        await db.refresh(asset)
+
+    return asset_to_file_out(asset, with_insight=True)
 
 
 @router.delete("/{project_id}/plan", status_code=status.HTTP_204_NO_CONTENT)
@@ -145,7 +208,50 @@ async def delete_plan(project_id: uuid.UUID, db: DbSession, user: CurrentUser) -
     if plan is not None:
         unlink_asset_files([plan])
         await db.delete(plan)
+        await _clear_plan_stages(db, project)
         await db.commit()
+
+
+@router.get("/{project_id}/plan/canonical")
+async def download_canonical_plan(
+    project_id: uuid.UUID, db: DbSession, user: CurrentUser
+) -> Response:
+    """The project's plan, re-expressed as a canonical-format `.xlsx` (see
+    plan_parser.py) — regardless of whether it got there via the fast path
+    or the LLM fallback (services/planner). Lets it be inspected/edited and
+    re-uploaded. 404 while there's nothing normalized yet (no plan, or the
+    LLM fallback hasn't finished — see PlanStage/analysis.py)."""
+    project = await _get_owned_project(db, user, project_id)
+    if project.plan_duration_days is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "План ещё не обработан")
+    stages = (
+        await db.execute(
+            select(PlanStage)
+            .where(PlanStage.project_id == project_id)
+            .order_by(PlanStage.phase_order)
+        )
+    ).scalars().all()
+    if not stages:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "План ещё не обработан")
+
+    content = build_canonical_workbook(
+        str(project_id),
+        [
+            CanonicalExportPhase(
+                phase=s.phase,
+                phase_order=s.phase_order,
+                planned_duration_days=s.planned_duration_days,
+                expected_equipment=json.loads(s.expected_equipment or "[]"),
+            )
+            for s in stages
+        ],
+        project.plan_duration_days,
+    )
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="plan_canonical.xlsx"'},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -170,18 +276,23 @@ async def add_entry(
 
     files = [f for f in files if f.filename]
     if not files:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Нужно загрузить хотя бы одно видео")
-    if len(files) > MAX_VIDEOS_PER_ENTRY:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Нужно загрузить хотя бы одно видео или фото"
+        )
+    if len(files) > MAX_FILES_PER_ENTRY:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"За один раз можно загрузить не более {MAX_VIDEOS_PER_ENTRY} видео",
+            f"За один раз можно загрузить не более {MAX_FILES_PER_ENTRY} файлов",
         )
+    kinds: list[str] = []
     for f in files:
-        if guess_kind(f.filename or "", f.content_type or "") != "video":
+        kind = guess_kind(f.filename or "", f.content_type or "")
+        if kind not in ("video", "image"):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"«{f.filename}» — не видеофайл",
+                f"«{f.filename}» — не видео и не фото",
             )
+        kinds.append(kind)
 
     entry = JournalEntry(
         project_id=project.id,
@@ -193,18 +304,18 @@ async def add_entry(
     await db.flush()
 
     assets: list[MediaAsset] = []
-    for f in files:
+    for f, kind in zip(files, kinds):
         asset_id = uuid.uuid4()
         storage_path, size = await save_upload(f, project.id, asset_id)
         asset = MediaAsset(
             id=asset_id,
             project_id=project.id,
             entry_id=entry.id,
-            role="journal_video",
-            original_name=f.filename or "video",
+            role="journal_video" if kind == "video" else "journal_photo",
+            original_name=f.filename or kind,
             content_type=f.content_type or "application/octet-stream",
             size=size,
-            kind="video",
+            kind=kind,
             storage_path=storage_path,
             analysis_status="pending",
         )
@@ -236,12 +347,12 @@ async def get_video(
             select(MediaAsset).where(
                 MediaAsset.id == video_id,
                 MediaAsset.project_id == project_id,
-                MediaAsset.role == "journal_video",
+                MediaAsset.role.in_(("journal_video", "journal_photo")),
             )
         )
     ).scalar_one_or_none()
     if asset is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Видео не найдено")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Файл не найден")
     return asset_to_file_out(asset, with_insight=True)
 
 

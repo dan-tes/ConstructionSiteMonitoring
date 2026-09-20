@@ -65,6 +65,21 @@ services:
   # Analysis pipeline services — see integrations/README.md for the topology.
   # Stub compute for now (real message bus, placeholder results); swapping in
   # the trained models is each service's own concern.
+  planner:
+    build: ../services/planner
+    container_name: csm-planner
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # Never put real values here — set YANDEX_CLOUD_* in the host's own
+      # environment or backend/.env (untracked); docker compose reads them
+      # from there. The service refuses to start without a real API key.
+      YANDEX_CLOUD_FOLDER: ${YANDEX_CLOUD_FOLDER:?set YANDEX_CLOUD_FOLDER in your environment/.env}
+      YANDEX_CLOUD_API_KEY: ${YANDEX_CLOUD_API_KEY:?set YANDEX_CLOUD_API_KEY in your environment/.env}
+      YANDEX_CLOUD_MODEL: ${YANDEX_CLOUD_MODEL:-yandexgpt-5-lite/latest}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
   vision:
     build: ../services/vision
     container_name: csm-vision
