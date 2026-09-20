@@ -17,7 +17,7 @@ from integrations.schemas import (
     DelayForecastResult,
     DetectResult,
     Envelope,
-    EquipmentEvent,
+    EquipmentCount,
     NormalizedPhase,
     PhaseResult,
     PlanNormalizeResult,
@@ -56,14 +56,7 @@ async def _fake_publish(routing_key: str, body: bytes) -> None:
     elif routing_key == broker.VISION_COMMAND:
         result = DetectResult(
             status="done",
-            events=[
-                EquipmentEvent(
-                    track_id=1,
-                    equipment_class="excavator",
-                    event="arrival",
-                    at=datetime.now(timezone.utc),
-                )
-            ],
+            counts=[EquipmentCount(equipment_class="excavator", count=1)],
         )
         await analysis.handle_vision_result(
             Envelope(

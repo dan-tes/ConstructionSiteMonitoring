@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, Uuid, func
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -78,6 +78,11 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="PlanStage.phase_order",
+    )
+    equipment_observations: Mapped[list["EquipmentObservation"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="EquipmentObservation.date",
     )
 
     @property
@@ -174,3 +179,31 @@ class PlanStage(Base):
     expected_equipment: Mapped[str] = mapped_column(Text, default="[]", server_default="[]", nullable=False)
 
     project: Mapped[Project] = relationship(back_populates="plan_stages")
+
+
+class EquipmentObservation(Base):
+    """One project's aggregated equipment counts for one calendar day —
+    merged (max per class) across every video/photo analysed that day, see
+    analysis.py's handle_vision_result. Exists so the phase model
+    (services/phase) gets a real multi-day sequence at inference instead of
+    a single-timestep observation: it was trained on WINDOW_SIZE=128
+    consecutive daily observations per project (see
+    phase_determination/construction_phase_training.ipynb's
+    build_project_timeline()), and feeding it a length-1 sequence turned out
+    to produce systematically unreliable predictions — see
+    services/phase/worker.py's module docstring."""
+
+    __tablename__ = "equipment_observations"
+    __table_args__ = (
+        UniqueConstraint("project_id", "date", name="uq_equipment_observations_project_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    # JSON-encoded {equipment_class: count}.
+    counts: Mapped[str] = mapped_column(Text, default="{}", server_default="{}", nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="equipment_observations")

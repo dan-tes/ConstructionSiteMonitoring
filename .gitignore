@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 phase_determination/data/
 phase_determination/visual_pretraining_checkpoints/
+*.pt
+services/phase/weights/best.pt

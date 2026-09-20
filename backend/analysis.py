@@ -45,19 +45,26 @@ from database import SessionLocal
 from integrations import broker
 from integrations.schemas import (
     CANONICAL_PHASES,
+    DailyEquipmentCounts,
     DelayForecastCommand,
     DelayForecastResult,
     DetectCommand,
     DetectResult,
     Envelope,
-    EquipmentEvent,
+    EquipmentCount,
     PhaseCommand,
     PhaseResult,
     PlanNormalizeResult,
     PlanPhaseIn,
 )
-from models import JournalEntry, MediaAsset, PlanStage, Project
+from models import EquipmentObservation, JournalEntry, MediaAsset, PlanStage, Project
 from plan_parser import ParsedPlan
+
+# How many days of a project's equipment-observation history to feed the
+# phase model — see services/phase/worker.py's WINDOW_SIZE (128) docstring;
+# a little more than that so its forward-fill has something to look back on
+# even near the start of the requested window.
+EQUIPMENT_HISTORY_DAYS = 200
 
 log = logging.getLogger("csm.analysis")
 
@@ -68,11 +75,11 @@ def _envelope(correlation_id: uuid.UUID, payload) -> Envelope:
     )
 
 
-def _summarize_equipment(events: list[EquipmentEvent]) -> str:
-    if not events:
+def _summarize_equipment(counts: list[EquipmentCount]) -> str:
+    if not counts:
         return "Техника в кадре не обнаружена."
-    classes = sorted({e.equipment_class for e in events})
-    return f"В кадре обнаружена техника ({len(events)} событий): {', '.join(classes)}."
+    parts = ", ".join(f"{c.equipment_class} ({c.count})" for c in sorted(counts, key=lambda c: c.equipment_class))
+    return f"В кадре обнаружена техника: {parts}."
 
 
 def _summarize_phase(result: PhaseResult) -> str:
@@ -115,6 +122,57 @@ async def _load_plan(db, project_id: uuid.UUID) -> ParsedPlan | None:
         for r in rows
     ]
     return ParsedPlan(phases=phases, project_duration_days=project.plan_duration_days)
+
+
+async def _upsert_equipment_observation(
+    db, project_id: uuid.UUID, obs_date: date, counts: list[EquipmentCount]
+) -> None:
+    """Merge this video/photo's counts into the project's daily aggregate
+    for `obs_date` — max per class, not sum: two videos shot the same day
+    are two partial views of the same day's site, not two additions (summing
+    would double-count a crane simply because it's visible in both clips).
+    Feeds the phase model's real multi-day history — see
+    services/phase/worker.py."""
+    existing = (
+        await db.execute(
+            select(EquipmentObservation).where(
+                EquipmentObservation.project_id == project_id,
+                EquipmentObservation.date == obs_date,
+            )
+        )
+    ).scalar_one_or_none()
+    merged = {c.equipment_class: c.count for c in counts}
+    if existing is not None:
+        for cls, n in json.loads(existing.counts).items():
+            merged[cls] = max(merged.get(cls, 0), n)
+        existing.counts = json.dumps(merged)
+    else:
+        db.add(EquipmentObservation(project_id=project_id, date=obs_date, counts=json.dumps(merged)))
+
+
+async def _load_equipment_history(db, project_id: uuid.UUID) -> list[DailyEquipmentCounts]:
+    """The project's real day-by-day equipment counts, chronological — sparse
+    (only days with an analysed video/photo) and capped to the last
+    `EQUIPMENT_HISTORY_DAYS` rows. See services/phase/worker.py's
+    `_build_window()` for how the phase service turns this into the dense
+    daily sequence its model expects."""
+    rows = (
+        await db.execute(
+            select(EquipmentObservation)
+            .where(EquipmentObservation.project_id == project_id)
+            .order_by(EquipmentObservation.date.desc())
+            .limit(EQUIPMENT_HISTORY_DAYS)
+        )
+    ).scalars().all()
+    return [
+        DailyEquipmentCounts(
+            date=r.date,
+            counts=[
+                EquipmentCount(equipment_class=cls, count=n) for cls, n in json.loads(r.counts).items()
+            ],
+        )
+        for r in reversed(rows)
+    ]
 
 
 async def _project_planned_start(db, project_id: uuid.UUID) -> date | None:
@@ -207,7 +265,6 @@ async def run_analysis(asset_id: uuid.UUID) -> None:
         asset_id=asset_id,
         media_url=f"{settings.internal_url}/files/{asset_id}",
         kind=asset.kind,
-        recorded_at=datetime.now(timezone.utc),
     )
     body = _envelope(asset_id, command).model_dump_json().encode()
     await broker.publish(broker.VISION_COMMAND, body)
@@ -220,16 +277,25 @@ async def handle_vision_result(envelope: Envelope[DetectResult]) -> None:
         await _mark_failed(asset_id, "vision", result.error)
         return
 
-    events = result.events or []
+    counts = result.counts or []
     async with SessionLocal() as db:
         asset = await db.get(MediaAsset, asset_id)
         if asset is None:
             return
-        asset.equipment_summary = _summarize_equipment(events)
+        asset.equipment_summary = _summarize_equipment(counts)
+        entry = await db.get(JournalEntry, asset.entry_id) if asset.entry_id else None
+        # Which calendar day this video/photo's equipment counts belong to —
+        # shouldn't be missing (analysing a video means its entry already
+        # exists), but falls back to today rather than raising if it is.
+        obs_date = entry.date if entry is not None else date.today()
+        await _upsert_equipment_observation(db, asset.project_id, obs_date, counts)
         plan = await _load_plan(db, asset.project_id)
+        history = await _load_equipment_history(db, asset.project_id)
         await db.commit()
 
-    command = PhaseCommand(plan_stages=plan.phases if plan else [], events=events)
+    command = PhaseCommand(
+        plan_stages=plan.phases if plan else [], history=history, as_of_date=obs_date
+    )
     body = _envelope(asset_id, command).model_dump_json().encode()
     await broker.publish(broker.PHASE_COMMAND, body)
 

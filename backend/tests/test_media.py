@@ -1,4 +1,5 @@
 import io
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -7,7 +8,7 @@ from sqlalchemy import select
 
 import analysis
 from integrations.schemas import Envelope, PlanNormalizeResult
-from models import PlanStage
+from models import EquipmentObservation, PlanStage
 from plan_parser import CANONICAL_COLUMNS
 
 VIDEO = ("clip.mp4", b"\x00\x00\x00 ftypisom" + b"\x00" * 64, "video/mp4")
@@ -38,6 +39,19 @@ async def _plan_stages(pid: str) -> list[PlanStage]:
             .scalars()
             .all()
         )
+
+
+async def _equipment_observations(pid: str) -> list[tuple]:
+    async with analysis.SessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(EquipmentObservation)
+                .where(EquipmentObservation.project_id == uuid.UUID(pid))
+                .order_by(EquipmentObservation.date)
+            )
+        ).scalars().all()
+        # Detach the values we need before the session closes.
+        return [(r.date, json.loads(r.counts)) for r in rows]
 
 
 async def test_plan_upload_download_delete(client, auth):
@@ -233,6 +247,37 @@ async def test_video_upload_runs_analysis_and_fills_plan_status(client, auth):
 
     served = await client.get(f"/files/{video_id}")
     assert served.status_code == 200
+
+
+async def test_video_analysis_accumulates_daily_equipment_history(client, auth):
+    """Each analysed video/photo should feed the phase model a real day-by-
+    day history (see analysis.py's _upsert_equipment_observation /
+    services/phase/worker.py) instead of only its own single-timestep
+    counts — two videos on different days become two daily rows; two on the
+    same day merge (max per class, not sum) into one."""
+    username, headers = await auth()
+    pid = await _project(client, headers)
+
+    async def _upload(date: str) -> None:
+        resp = await client.post(
+            f"/projects/{pid}/entries",
+            headers=headers,
+            data={"author": username, "date": date},
+            files=[("files", VIDEO)],
+        )
+        assert resp.status_code == 201
+
+    await _upload("2026-09-01")
+    await _upload("2026-09-01")  # same day — should merge, not add a row
+    await _upload("2026-09-03")
+
+    observations = await _equipment_observations(pid)
+    dates = [d.isoformat() for d, _ in observations]
+    assert dates == ["2026-09-01", "2026-09-03"]
+    # conftest's fake vision result is always excavator:1 — merging two same-
+    # day videos of it via max should still read 1, not 2.
+    assert observations[0][1] == {"excavator": 1}
+    assert observations[1][1] == {"excavator": 1}
 
 
 async def test_photo_upload_runs_analysis_and_fills_plan_status(client, auth):

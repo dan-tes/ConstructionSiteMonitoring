@@ -42,7 +42,6 @@ class DetectCommand(BaseModel):
     asset_id: uuid.UUID
     media_url: str  # {public_base_url}/files/{asset_id} — service fetches it itself
     kind: Literal["video", "image"]  # how to run detection — track a video, or a single frame
-    recorded_at: datetime  # wall-clock moment the video starts (or the photo was taken)
 
 
 # MOCS (Moving Objects on Construction Sites) detector classes.
@@ -63,16 +62,14 @@ EquipmentClass = Literal[
 ]
 
 
-class EquipmentEvent(BaseModel):
-    track_id: int
+class EquipmentCount(BaseModel):
     equipment_class: EquipmentClass
-    event: Literal["arrival", "departure"]
-    at: datetime
+    count: int
 
 
 class DetectResult(BaseModel):
     status: Literal["done", "failed"]
-    events: list[EquipmentEvent] | None = None
+    counts: list[EquipmentCount] | None = None
     error: str | None = None
 
 
@@ -161,10 +158,28 @@ class PlanNormalizeResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Phase — current project phase (диаграмма: блок 3)
 # routing keys: phase.command / phase.result
+#
+# The phase model was trained on WINDOW_SIZE=128 consecutive *daily*
+# equipment observations per project (see
+# phase_determination/construction_phase_training.ipynb's
+# build_project_timeline()) — a single-timestep observation is out of that
+# distribution and was found to produce systematically unreliable
+# predictions (see services/phase/worker.py's module docstring). `history`
+# carries the project's real day-by-day equipment counts instead — sparse
+# (only days with an analysed video/photo; a project doesn't get filmed
+# every day) and NOT necessarily consecutive, so the phase service anchors
+# each entry on its own `date` and fills the gaps itself rather than
+# assuming the list's positions line up with calendar days.
 # ---------------------------------------------------------------------------
+class DailyEquipmentCounts(BaseModel):
+    date: date
+    counts: list[EquipmentCount]
+
+
 class PhaseCommand(BaseModel):
     plan_stages: list[PlanPhaseIn]
-    events: list[EquipmentEvent]
+    history: list[DailyEquipmentCounts]  # chronological, sparse — see above
+    as_of_date: date  # which day to predict the phase "as of" (the latest entry's date)
 
 
 class PhaseResult(BaseModel):

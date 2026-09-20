@@ -10,7 +10,7 @@ hand with the backend copy if the phase contract changes.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel
@@ -47,16 +47,20 @@ EquipmentClass = Literal[
 ]
 
 
-class EquipmentEvent(BaseModel):
-    track_id: int
+class EquipmentCount(BaseModel):
     equipment_class: EquipmentClass
-    event: Literal["arrival", "departure"]
-    at: datetime
+    count: int
+
+
+class DailyEquipmentCounts(BaseModel):
+    date: date
+    counts: list[EquipmentCount]
 
 
 class PhaseCommand(BaseModel):
     plan_stages: list[PlanPhaseIn]
-    events: list[EquipmentEvent]
+    history: list[DailyEquipmentCounts]  # chronological, sparse, gaps expected
+    as_of_date: date
 
 
 class PhaseResult(BaseModel):

@@ -22,8 +22,8 @@ Four services sit behind the backend, which is the pipeline's orchestrator
 | Service | Diagram block | Responsibility |
 | --- | --- | --- |
 | **planner** | 1 — план объекта (LLM fallback) | Given a free-form uploaded plan the canonical parser rejected, re-expresses it onto the 10 canonical phases via an LLM |
-| **vision** | 2 — детекция и трекинг | Runs YOLO over an uploaded video, tracks equipment, emits arrival/departure events |
-| **phase** | 3 — понять фазу проекта | Given the plan schedule + equipment events, decides the current construction phase |
+| **vision** | 2 — детекция и подсчёт | Runs YOLO over an uploaded video/photo, counts equipment on site by class |
+| **phase** | 3 — понять фазу проекта | Given the plan schedule + equipment counts, decides the current construction phase |
 | **delay** | 4 — прогноз отставания | Given the plan schedule + current phase + today's date, forecasts schedule lag |
 
 Block 1 (uploaded plan → `plan_stages`) has two paths, both landing in the
@@ -90,7 +90,7 @@ does, and that's the end of it — no further command follows.
 
 `run_analysis()` itself becomes a choreography driven by result messages
 rather than a straight-line `await` chain: publish `vision.command` → on
-`vision.result` persist events and publish `phase.command` → on
+`vision.result` persist equipment counts and publish `phase.command` → on
 `phase.result` persist the phase and publish `delay.command` → on
 `delay.result` persist the forecast and move on to GPT summaries (blocks
 5/6, TBD). Each stage transition happens in the backend's result consumer,
@@ -132,20 +132,22 @@ same way `analysis_status = "failed"` works today, no separate error path.
   job-submission + polling specifically to avoid a broker; now that a broker
   is the standard connection, polling has no reason to exist — a result
   message arriving *is* the "job done" signal.
-- **Absolute timestamps everywhere, not video-relative offsets.** The vision
-  service receives `recorded_at` (the video's real-world start time) in
-  `DetectCommand` and converts internally, so `EquipmentEvent.at` is a real
-  `datetime`. Phase and delay never need to know a video's start time or do
-  offset math themselves — `as_of_date` and `planned_start` are already
-  resolved to real calendar dates by the backend before either command goes
-  out (see the `plan_stages` item below for where `planned_start` actually
-  comes from).
-- **Events, not aggregates, out of vision.** `EquipmentEvent` is a raw
-  arrival/departure log (`track_id`, `equipment_class`, `event`, `at`), not a
-  pre-aggregated per-class summary. This lets a track's re-appearances be
-  told apart from a different unit of the same class, and lets any
-  aggregation (occupancy at time T, idle ratio, counts) be derived later
-  instead of baked into the vision contract.
+- **Counts, not a timestamped event log, out of vision.** `DetectResult`
+  carries `EquipmentCount` (`equipment_class`, `count`) — how much of each
+  class vision saw in this video/photo, full stop. There's no per-detection
+  timestamp and no arrival/departure distinction, because there's nothing to
+  hang them on yet: a video/photo is one moment, and the construction phase
+  doesn't change within it, so nothing downstream needs to know *when*
+  within that clip a unit showed up, only that it did. Video still runs
+  ByteTrack so the same physical unit isn't counted once per frame — each
+  track contributes to its class's count exactly once — but the track ids
+  themselves don't leave the service. `as_of_date`/`planned_start` (phase and
+  delay's own calendar anchors) are unrelated to this and are resolved by
+  the backend before either command goes out — see the `plan_stages` item
+  below for where `planned_start` comes from. If a later requirement needs
+  presence-over-time (long-running footage where the phase itself might
+  shift), that's a reason to reintroduce a timestamped event stream, not to
+  retrofit one onto counts.
 - **`equipment_class` is the MOCS class set**, not a free string:
   `worker`, `tower_crane`, `hanging_hook`, `vehicle_crane`, `roller`,
   `bulldozer`, `excavator`, `truck`, `loader`, `pump_truck`,
@@ -161,40 +163,93 @@ same way `analysis_status = "failed"` works today, no separate error path.
   date delay actually needs, `planned_start`, is carried separately on
   `DelayForecastCommand` — the backend resolves it from the project's
   earliest journal entry, since the canonical plan has nothing to give it.
-- **Backend owns persistence.** Services are stateless message handlers; raw
-  `events` and the phase/delay results are stored on
-  `MediaAsset`/`Project` by the backend (see `models.py`), not by the
-  services themselves.
+- **A per-project daily equipment history, not just per-video counts.**
+  `analysis.py` persists each day's equipment counts to
+  `EquipmentObservation` (merged, max per class, across every video/photo
+  analysed that day), and sends the phase service the project's real
+  history (`PhaseCommand.history`, sparse and NOT necessarily consecutive —
+  see `DailyEquipmentCounts`) instead of only the counts from whichever
+  video triggered this run. The phase model was trained on real multi-day
+  windows; a single video's counts alone turned out to be enough out of
+  that distribution to produce wrong predictions — see
+  `services/phase/worker.py`'s docstring.
+- **Backend owns persistence.** Services are stateless message handlers; the
+  equipment counts and the phase/delay results are stored on
+  `MediaAsset`/`Project`/`EquipmentObservation` by the backend (see
+  `models.py`), not by the services themselves.
 - **`correlation_id` is the `MediaAsset.id`.** One analysis run == one
   uploaded journal video, so the asset's own id is a sufficient join key
   across all three result queues; no separate run-id table needed.
 
 ## Open items
 
-- **vision**: only maps COCO's `truck`/`person` to the MOCS equipment set —
-  every other class (excavator, crane, bulldozer, ...) has no COCO
-  equivalent, so the pretrained detector can never report them. A
-  MOCS-trained detector (`cv/b.ipynb` is the training pipeline for one) is
-  what actually unlocks the rest of `EquipmentClass`.
-- **vision**: emits `"arrival"` once per track and never `"departure"` — no
-  presence/exit tracking yet.
+- **vision**: resolved — `weights/best.pt` is confirmed (by loading it and
+  checking `model.names`) to be a real MOCS-trained detector, not the
+  COCO-pretrained one this bullet used to describe; it natively reports all
+  13 `EquipmentClass` values, not just `truck`/`worker`. Verified against
+  real construction photos (`phase_determination/data/Строительная
+  техника/`): varied, high-confidence detections across most classes. See
+  `services/vision/worker.py`'s docstring.
+- **vision**: video tracking can over-count on small/distant subjects in an
+  aerial shot — ByteTrack repeatedly loses and re-acquires the same person
+  instead of holding one track, so a naive "one track, one count" rule
+  measured 175 distinct `worker`s on a 15-second real clip
+  (`cv/your_video.mp4`) that clearly doesn't have that many. `MIN_TRACK_SECONDS`
+  filters out tracks shorter than that (175 → 68 on the same clip) — a
+  mitigation, not a precise fix; see that module's docstring for why there's
+  no clean cutoff between "flicker" and "genuinely brief real detection".
 - **vision**: no zone splitting. `cv/a.ipynb` assigns each detection to a
   site zone (`ZONES`/`assign_zone`) and checks per-zone deviations against a
-  schedule; this service reports "this equipment class arrived somewhere in
-  frame" with no location on site. Needs a per-project floor plan / camera-
-  to-site mapping that doesn't exist yet.
-- **phase**: fed a single-timestep observation (whatever's in this video's
-  events) instead of the multi-day windowed history
-  (`build_project_timeline()` in the training notebook) the model was
-  trained on, and skips the training data's simulated detector noise
-  (`visible`/`confidence` are always 1.0). Both are reasonable live-inference
-  stand-ins, not a faithful reproduction — see `services/phase/worker.py`'s
-  docstring. A real fix needs module 2 to persist a daily occupancy history
-  per project, not just per-video events.
+  schedule; this service reports "this equipment class is present somewhere
+  in frame" with no location on site. Needs a per-project floor plan /
+  camera-to-site mapping that doesn't exist yet.
+- **phase**: still skips the training data's simulated detector noise
+  (`visible`/`confidence` are always 1.0 rather than the miss/false-
+  positive-perturbed values training simulated) — a reasonable
+  live-inference stand-in, not a faithful reproduction. The bigger gap this
+  bullet used to describe — a single-timestep observation instead of the
+  multi-day windowed history (`build_project_timeline()` in the training
+  notebook) the model was actually trained on — is closed: `analysis.py`
+  now persists a real per-project daily equipment history
+  (`EquipmentObservation`, merged per class across same-day videos), and
+  `services/phase/worker.py`'s `_build_window()` feeds the model a real
+  `WINDOW_SIZE`-day sequence, forward-filling days with no analysed video.
+  See that module's docstring for why the single-timestep version was found
+  (by direct testing against the real checkpoint, not just suspected) to
+  produce systematically wrong predictions for equipment whose phase
+  association isn't overwhelmingly one-sided.
+- **phase**: resolved — `best.pt` had a real accuracy limitation for phases
+  with overlapping equipment sets, confirmed by direct testing (not just
+  suspected): fed the real counts detected from `cv/your_video.mp4`
+  (tower_crane, hanging_hook, worker, other_vehicle, concrete_mixer,
+  excavator, vehicle_crane), it predicted `"MEP"` at 90-99% confidence —
+  confidence *rising* with more history, so this wasn't the sequence-length
+  issue above — despite `concrete_mixer` never once appearing in an MEP
+  training activity (100% Foundation/Structural Frame) and
+  `tower_crane`/`hanging_hook` being present in only 21% of MEP's activities
+  vs. 91% of Structural Frame's. Root cause: `_build_phase_meta()`'s
+  per-phase "expected equipment" was a binary set (any activity of that
+  phase ever using class X counted the same as every activity using it),
+  washing out exactly the signal needed to tell equipment-overlapping phases
+  apart. Fixed by retraining, not an inference-side patch — `worker.py`
+  deliberately reproduces the training feature construction, so the binary-
+  set behavior was baked into what `best.pt` had learned.
+  `phase_determination/retrain_weighted_equipment.py` retrains the same
+  architecture with each phase's actual equipment *prevalence fraction*
+  instead; the new `best.pt` (deployed, old one is in git history) scores
+  89.3% test accuracy — see that script's docstring and its printed
+  classification report — and correctly predicts `"Foundation"` for the
+  same real video counts instead of `"MEP"`. Not perfect: an artificially
+  long run of *identical* daily counts (128 straight days of the exact same
+  numbers — not a pattern any real project produces) still drifts back
+  toward `"MEP"`, so this is a real improvement on realistic inputs, not a
+  guarantee against every synthetic edge case.
 - **delay**: `current_phase_started_at` is simplified to `planned_start +`
   the matched phase's offset (assumes the phase started on time) — there's
-  no history of when the phase detector first reported the current phase
-  for a project to use instead. Same root cause as the phase item above.
+  no history of when the phase detector *itself* first reported the current
+  phase for a project. A different history than the equipment counts phase
+  now has (see above) — this one would need every `phase.result` persisted
+  per project, not just consumed and discarded.
 - **delay**: `planned_start` (the project start anchor) is the project's
   *earliest journal entry date*, not a real "project kickoff" date — a
   project whose first uploaded video is well into construction will

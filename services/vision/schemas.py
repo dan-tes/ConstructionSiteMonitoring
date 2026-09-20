@@ -28,7 +28,6 @@ class DetectCommand(BaseModel):
     asset_id: uuid.UUID
     media_url: str
     kind: Literal["video", "image"]
-    recorded_at: datetime
 
 
 EquipmentClass = Literal[
@@ -48,26 +47,12 @@ EquipmentClass = Literal[
 ]
 
 
-class EquipmentEvent(BaseModel):
-    track_id: int
+class EquipmentCount(BaseModel):
     equipment_class: EquipmentClass
-    event: Literal["arrival", "departure"]
-    at: datetime
-
-    def __str__(self):
-        return f'{self.track_id} : cl: {self.equipment_class}, at {self.at}, {self.event}'
-
-    def __repr__(self):
-        return self.__str__()
+    count: int
 
 
 class DetectResult(BaseModel):
     status: Literal["done", "failed"]
-    events: list[EquipmentEvent] | None = None
+    counts: list[EquipmentCount] | None = None
     error: str | None = None
-
-    def __str__(self):
-        return str(self.status) + '\n'.join([str(i) for i in self.events])
-
-    def __repr__(self):
-        return self.__str__()
