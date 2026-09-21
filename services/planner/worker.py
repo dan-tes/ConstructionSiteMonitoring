@@ -6,18 +6,29 @@ topology this is one leg of, and backend/plan_parser.py for the fast path
 this is the fallback for: that parser only accepts an already-canonical
 21-column workbook. Most uploaded plans — an MS Project/Primavera/Excel
 export with its own column names and its own names for work items — aren't
-in that shape, so this service asks an LLM to re-express the plan on our 10
-canonical phases instead.
+in that shape, so this service normalizes the plan onto our 10 canonical
+phases instead.
 
-The 10 phases and their expected equipment are not something a language
-model is expected to invent correctly on its own — they're an empirically
-derived reference (data/phase_equipment_reference.csv, sourced from the
-project's own equipment-usage study; see phase_determination/data/ for the
-canonical copy) fed into the prompt so the model has a closed vocabulary to
-map onto instead of free-text guessing. The model still has to do the hard
-part: read whatever the source plan's own phases/work items are called and
-decide which canonical phase(s) each maps to, and roughly how many days of
-that phase's duration each accounts for.
+The phase/equipment breakdown is produced by `plan_normalizer.normalize()`
+(see that module's docstring): a two-stage pipeline where an LLM only does
+the two things that need "meaning" — reading the source table's structure,
+and classifying each row's work into a CLOSED vocabulary of activity types —
+while ordinary code does everything else (numbers, units, validation). The
+closed vocabulary (43 activity types -> phase -> expected equipment) comes
+from `data/canonical_plan.xlsx`, an empirical reference, not something the
+model is asked to invent. This replaces the previous single-prompt design
+that asked the model to guess whole-phase durations directly; classifying
+per activity and letting code sum durations per phase is both more accurate
+and auditable (`normalize()`'s log/problems explain every row's fate).
+
+`plan_normalizer.normalize()` deliberately does not attempt an overall
+project (critical-path) duration — the source plan has no dependency graph
+to derive one from, so a per-activity classifier has nothing to base it on
+without guessing. `project_duration_days` is still produced by a single,
+narrow LLM call here (`_estimate_project_duration`) that only asks for that
+one number, using judgement about how much adjacent phases typically
+overlap — the same kind of holistic estimate the old single-prompt design
+made, just no longer bundled with the (now per-activity) phase breakdown.
 
 REAL model: Yandex Cloud's OpenAI-compatible endpoint (YandexGPT) — see the
 YANDEX_CLOUD_* env vars below; the API key has no default and the service
@@ -36,6 +47,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,6 +56,7 @@ import httpx
 import openai
 import pandas as pd
 
+import plan_normalizer
 from schemas import (
     CANONICAL_PHASES,
     EQUIPMENT_CLASSES,
@@ -69,76 +82,64 @@ YANDEX_CLOUD_API_KEY = os.environ["YANDEX_CLOUD_API_KEY"]
 YANDEX_CLOUD_MODEL = os.environ.get("YANDEX_CLOUD_MODEL", "yandexgpt-5-lite/latest")
 
 DATA_DIR = Path(__file__).parent / "data"
-# Cap on how much of the source plan's table gets forwarded to the model —
-# keeps a large uploaded schedule inside a sane token budget. A canonical
-# plan is thousands of activity rows, but a free-form one being normalized
-# here is normally a hundred phase-level line items or fewer, so this should
-# rarely bind; it truncates rather than fails when it does, since a partial
-# read is still better than none.
+CANONICAL_PLAN_PATH = DATA_DIR / "canonical_plan.xlsx"
+# Cross-request cache of (activity name + section context) -> classification
+# decision (see plan_normalizer.normalize()'s `key()`/`cache`). Worth keeping
+# across different projects' plans, not just within one: unrelated customer
+# plans routinely reuse the same activity names ("Опалубка колонн", "Footing
+# Concrete", ...), so this is a real hit rate, not a one-shot optimization.
+CLASSIFICATION_CACHE_PATH = DATA_DIR / "classification_cache.json"
+# Cap on how much of the source plan's table gets forwarded to the model for
+# the project-duration estimate below — keeps a large uploaded schedule
+# inside a sane token budget. A canonical plan is thousands of activity
+# rows, but a free-form one being normalized here is normally a hundred
+# line items or fewer, so this should rarely bind; it truncates rather than
+# fails when it does, since a partial read is still better than none.
 MAX_SOURCE_ROWS = 500
 
 _client = openai.OpenAI(
     api_key=YANDEX_CLOUD_API_KEY,
     base_url="https://ai.api.cloud.yandex.net/v1",
     project=YANDEX_CLOUD_FOLDER,
+    # AI Studio logs requests by default; an uploaded customer plan can be
+    # confidential (same precaution plan_normalizer.py takes on its own).
+    default_headers={"x-data-logging-enabled": "false"},
 )
 
-
-def _build_reference_table_text() -> str:
-    ref = pd.read_csv(DATA_DIR / "phase_equipment_reference.csv")
-    lines = []
-    for phase in CANONICAL_PHASES:
-        rows = ref[ref["phase"] == phase]
-        if rows.empty:
-            continue
-        equipment = ", ".join(
-            f"{r.equipment_class} ({r.tier}, ~{r.presence_pct:.0f}% of projects, "
-            f"{r.count_min}-{r.count_max} units)"
-            for r in rows.itertuples()
-        )
-        lines.append(f"{CANONICAL_PHASES.index(phase) + 1}. {phase}: {equipment}")
-    return "\n".join(lines)
+# Fail fast at import time, not on the first request, if the reference
+# vocabulary is missing/malformed or (implausibly) uses phase names that
+# don't match the CanonicalPhase contract the rest of the pipeline relies on.
+_startup_vocab = plan_normalizer.Vocab(str(CANONICAL_PLAN_PATH))
+_unknown_phases = set(_startup_vocab.phases) - set(CANONICAL_PHASES)
+if _unknown_phases:
+    raise RuntimeError(
+        f"{CANONICAL_PLAN_PATH} has phases not in the CanonicalPhase contract: {_unknown_phases}"
+    )
+del _startup_vocab, _unknown_phases
 
 
-def _build_system_prompt() -> str:
-    numbered_phases = "\n".join(f"{i + 1}. {p}" for i, p in enumerate(CANONICAL_PHASES))
-    return f"""You are a construction-scheduling assistant. You will be given a \
-free-form construction schedule/plan (arbitrary columns, arbitrary phase or \
-work-item names, possibly in Russian or English) as a table. Your job is to \
-re-express it using exactly these 10 canonical construction phases, in this \
-fixed order, and no others:
-
-{numbered_phases}
-
-For each canonical phase that the source plan has any work mapping to, \
-estimate its total planned duration in days (if the source gives dates, use \
-them; if it gives a duration per work item, sum the ones that map to that \
-phase; use judgement for work that clearly overlaps in time). Omit a \
-canonical phase entirely if the source plan has no matching work — do not \
-invent a phase that isn't represented.
-
-Also pick, for each included phase, which equipment classes are expected on \
-site during it, using ONLY these exact class names: {", ".join(EQUIPMENT_CLASSES)}.
-The reference table below (empirically derived from real projects) shows how \
-often each class shows up per phase — use it as your prior, adjusted by \
-whatever equipment the source plan itself mentions for that phase:
-
-{_build_reference_table_text()}
-
-Finally, estimate project_duration_days: the total project critical-path \
-duration in days from start to finish (use an explicit total or an overall \
-date range from the source plan if it gives one; otherwise sum the phase \
-durations you estimated, discounted for the overlap typical between \
-adjacent phases).
-
-Respond with ONLY a single JSON object, no markdown code fences, no \
-commentary before or after it, matching exactly this shape:
-{{"project_duration_days": <number>, "phases": [{{"phase": "<one of the 10 \
-names above, exact spelling>", "planned_duration_days": <number>, \
-"expected_equipment": ["<equipment class>", ...]}}]}}"""
-
-
-SYSTEM_PROMPT = _build_system_prompt()
+def _llm_call(system: str, user: str, tool: dict) -> dict:
+    """Adapter matching plan_normalizer's `LLM` callable, backed by this
+    service's own Yandex client/env vars instead of plan_normalizer's own
+    (differently-named) ones. Same call shape as plan_normalizer.yandex_llm:
+    Yandex's OpenAI-compatible Completions API with structured (json_schema)
+    output — one consistent call style for every LLM call this service
+    makes (structure detection, activity classification, and the duration
+    estimate below)."""
+    schema = tool["input_schema"]
+    system = (
+        system
+        + "\n\nReturn ONLY a JSON object that conforms to this JSON Schema:\n"
+        + json.dumps(schema, ensure_ascii=False)
+    )
+    resp = _client.chat.completions.create(
+        model=f"gpt://{YANDEX_CLOUD_FOLDER}/{YANDEX_CLOUD_MODEL}",
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0,
+        max_tokens=4000,
+        response_format={"type": "json_schema", "json_schema": {"name": tool["name"], "schema": schema}},
+    )
+    return plan_normalizer._extract_json(resp.choices[0].message.content)
 
 
 def _plan_text_from_bytes(original_name: str, content: bytes) -> str:
@@ -155,37 +156,56 @@ def _plan_text_from_bytes(original_name: str, content: bytes) -> str:
     return df.to_csv(index=False)
 
 
-def _parse_model_output(text: str) -> tuple[list[NormalizedPhase], float]:
-    text = text.strip()
-    if text.startswith("```"):
-        # Strip a ```json ... ``` fence if the model added one despite being
-        # told not to — tolerate the formatting quirk, not the content.
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:]
-    data = json.loads(text)
-    project_duration_days = float(data["project_duration_days"])
-    all_phases = [NormalizedPhase.model_validate(p) for p in data["phases"]]
+_DURATION_TOOL = {
+    "name": "estimate_project_duration",
+    "description": "Overall project critical-path duration, in days.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"project_duration_days": {"type": "number"}},
+        "required": ["project_duration_days"],
+    },
+}
 
-    # A phase with a non-positive duration is the model including a phase it
-    # was told to omit (observed live: an unmatched "Commissioning" comes
-    # back at 0 days instead of being left out) — drop just that phase
-    # rather than failing the whole normalization over one harmless zero.
-    # Model output isn't guessed at here, just filtered on an unambiguous
-    # signal; a malformed *phase name* still fails loudly (see the Literal
-    # validation in NormalizedPhase above) since there's no safe filter for
-    # that.
-    phases = [p for p in all_phases if p.planned_duration_days > 0]
-    if not phases:
-        raise ValueError("model returned no phases with a positive duration")
-    seen: set[str] = set()
-    for p in phases:
-        if p.phase in seen:
-            raise ValueError(f"duplicate phase {p.phase!r} in model output")
-        seen.add(p.phase)
-    if project_duration_days <= 0:
+_DURATION_SYSTEM_PROMPT = """You are a construction-scheduling assistant. You are given a \
+free-form construction schedule/plan (arbitrary columns, arbitrary phase or work-item \
+names, possibly in Russian or English) as a table.
+
+Estimate project_duration_days: the total project critical-path duration in days from \
+start to finish. Use an explicit total or an overall start/finish date range if the \
+source plan gives one; otherwise sum the durations of the individual work items, \
+discounted for how much adjacent/overlapping work typically runs in parallel on a \
+construction site. Respond with a single JSON object only: no markdown, no commentary."""
+
+
+def _estimate_project_duration(plan_text: str) -> float:
+    out = _llm_call(_DURATION_SYSTEM_PROMPT, f"Schedule:\n{plan_text}", _DURATION_TOOL)
+    value = float(out["project_duration_days"])
+    if value <= 0:
         raise ValueError("non-positive project_duration_days")
-    return phases, project_duration_days
+    return value
+
+
+def _aggregate_phases(plan_df: pd.DataFrame) -> list[NormalizedPhase]:
+    """Per-activity canonical rows -> per-phase totals. Durations are summed
+    (not estimated) and equipment is the union of what each included
+    activity expects — both plain code, no LLM judgement involved, since
+    plan_normalizer.normalize() already did the only part that needed it
+    (classifying each activity)."""
+    phases = []
+    for (_, phase), rows in plan_df.groupby(["phase_order", "phase"], sort=True):
+        equipment: set[str] = set()
+        for eq in rows["expected_equipment"]:
+            equipment.update(e for e in eq if e in EQUIPMENT_CLASSES)
+        phases.append(
+            NormalizedPhase(
+                phase=phase,
+                planned_duration_days=float(rows["planned_duration_days"].dropna().sum()),
+                expected_equipment=sorted(equipment),
+            )
+        )
+    if not phases:
+        raise ValueError("plan_normalizer produced no phases")
+    return phases
 
 
 def compute(command: PlanNormalizeCommand) -> PlanNormalizeResult:  # EXTENSION POINT
@@ -199,25 +219,33 @@ def compute(command: PlanNormalizeCommand) -> PlanNormalizeResult:  # EXTENSION 
         len(plan_text),
         YANDEX_CLOUD_MODEL,
     )
-    completion = _client.responses.create(
-        model=f"gpt://{YANDEX_CLOUD_FOLDER}/{YANDEX_CLOUD_MODEL}",
-        temperature=0.2,
-        instructions=SYSTEM_PROMPT,
-        input=plan_text,
-        max_output_tokens=6000,
-        store=True,
-        # "none" — yandexgpt-5-lite is a non-reasoning model; a "low"/"medium"
-        # effort value here is untested against the real API and may simply
-        # be rejected, so this matches the confirmed-working call verbatim
-        # rather than guessing.
-        reasoning={"effort": "none"},
-        truncation="auto",
-    )
-    phases, project_duration_days = _parse_model_output(completion.output_text)
+
+    ext = command.original_name.rsplit(".", 1)[-1].lower() if "." in command.original_name else "csv"
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}") as tmp:
+        tmp.write(response.content)
+        tmp.flush()
+        plan_df, _log_df, problems, _vocab = plan_normalizer.normalize(
+            tmp.name,
+            str(CANONICAL_PLAN_PATH),
+            str(command.asset_id),
+            llm=_llm_call,
+            cache_path=str(CLASSIFICATION_CACHE_PATH),
+        )
+
+    hard_problems = [p for p in problems if not p.startswith("WARNING")]
+    if hard_problems or plan_df.empty:
+        raise ValueError(
+            "plan_normalizer rejected this plan: " + "; ".join(hard_problems or ["empty plan"])
+        )
+
+    phases = _aggregate_phases(plan_df)
+    project_duration_days = _estimate_project_duration(plan_text)
+
     log.info(
-        "normalized plan for asset %s into %d phases, %.0f total days",
+        "normalized plan for asset %s into %d phases (%d source activities), %.0f total days",
         command.asset_id,
         len(phases),
+        len(plan_df),
         project_duration_days,
     )
     return PlanNormalizeResult(

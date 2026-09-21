@@ -1,12 +1,27 @@
 """Video-analysis pipeline — orchestrated over RabbitMQ.
 
-`run_analysis()` no longer does the analysis itself: it publishes a
-`vision.command` message and returns. The rest of the pipeline is a
-choreography driven by result messages (see integrations/README.md for the
-full topology): each `handle_*_result` below is registered as a consumer
-(see `start_consumers()`, wired up from `main.py`) and, on success, persists
-its step's output and publishes the next command. The final step
-(`handle_delay_result`) marks the asset `ready`.
+One journal entry (`JournalEntry`) is one upload batch — the photos/videos a
+site visit produced, uploaded together. Vision (equipment detection) still
+runs once per file, because detection is genuinely a per-file operation, but
+phase/delay/visual_phase run ONCE for the whole entry, not once per file:
+`run_entry_analysis()` kicks off vision for every file in the entry, and
+`_maybe_advance_entry()` fires the entry's one `phase.command` only once
+every file has reported its own vision result — see that function's
+docstring. The rest of the pipeline is a choreography driven by result
+messages (see integrations/README.md for the full topology): each
+`handle_*_result` below is registered as a consumer (see `start_consumers()`,
+wired up from `main.py`) and, on success, persists its step's output and
+publishes the next command. The final step (`handle_delay_result`) marks the
+entry `ready`.
+
+This replaced an earlier design where every step (vision *and*
+phase/delay/visual_phase) ran per individual photo/video: uploading three
+photos in one entry used to produce three separate, slightly-redundant phase
+calls and three separate result pages, instead of the site visit's one
+actual phase. `MediaAsset.analysis_status` still exists (needed for the
+plan-normalization step, and to track each file's own vision progress), but
+`stage_summary`/`equipment_summary`/`visual_phase_*` now live on
+`JournalEntry` only.
 
 `plan_stages` comes from `models.PlanStage`, populated once at plan-upload
 time (see `routers/projects.py`'s `upload_plan`) rather than re-read from
@@ -36,6 +51,7 @@ from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.orm import selectinload
 
 if TYPE_CHECKING:
     from fastapi import BackgroundTasks
@@ -56,6 +72,8 @@ from integrations.schemas import (
     PhaseResult,
     PlanNormalizeResult,
     PlanPhaseIn,
+    VisualPhaseCommand,
+    VisualPhaseResult,
 )
 from models import EquipmentObservation, JournalEntry, MediaAsset, PlanStage, Project
 from plan_parser import ParsedPlan
@@ -132,7 +150,11 @@ async def _upsert_equipment_observation(
     are two partial views of the same day's site, not two additions (summing
     would double-count a crane simply because it's visible in both clips).
     Feeds the phase model's real multi-day history — see
-    services/phase/worker.py."""
+    services/phase/worker.py. Note this merges across every entry on
+    `obs_date`, not just one entry's own files — two separate entries
+    uploaded for the same calendar date share one row here (and so, via
+    `_maybe_advance_entry`, one combined `equipment_summary` text) — a
+    pre-existing simplification, not new to entry-level combination."""
     existing = (
         await db.execute(
             select(EquipmentObservation).where(
@@ -179,8 +201,8 @@ async def _project_planned_start(db, project_id: uuid.UUID) -> date | None:
     """Project start anchor for the delay forecast. The canonical plan
     carries no calendar dates (see plan_parser.py), so this is the earliest
     journal entry date recorded for the project instead — a project with no
-    entries yet (shouldn't happen mid-analysis, since analysing a video
-    means its entry already exists) has no anchor to forecast from."""
+    entries yet (shouldn't happen mid-analysis, since analysing an entry
+    means it already exists) has no anchor to forecast from."""
     return (
         await db.execute(
             select(func.min(JournalEntry.date)).where(JournalEntry.project_id == project_id)
@@ -188,27 +210,26 @@ async def _project_planned_start(db, project_id: uuid.UUID) -> date | None:
     ).scalar_one_or_none()
 
 
-async def _mark_failed(asset_id: uuid.UUID, step: str, error: str | None) -> None:
-    log.error("analysis step %r failed for asset %s: %s", step, asset_id, error)
+async def _mark_entry_failed(entry_id: uuid.UUID, step: str, error: str | None) -> None:
+    log.error("analysis step %r failed for entry %s: %s", step, entry_id, error)
     async with SessionLocal() as db:
-        asset = await db.get(MediaAsset, asset_id)
-        if asset is not None:
-            asset.analysis_status = "failed"
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is not None:
+            entry.analysis_status = "failed"
             await db.commit()
 
 
 async def _refresh_plan_status(db, project_id: uuid.UUID) -> None:
     """Project-level summary = stage summary of the most recently analysed
-    video or photo."""
+    journal entry."""
     latest = (
         await db.execute(
-            select(MediaAsset)
+            select(JournalEntry)
             .where(
-                MediaAsset.project_id == project_id,
-                MediaAsset.role.in_(("journal_video", "journal_photo")),
-                MediaAsset.analysis_status == "ready",
+                JournalEntry.project_id == project_id,
+                JournalEntry.analysis_status == "ready",
             )
-            .order_by(MediaAsset.analyzed_at.desc())
+            .order_by(JournalEntry.analyzed_at.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -225,7 +246,12 @@ async def handle_plan_result(envelope: Envelope[PlanNormalizeResult]) -> None:
     asset_id = envelope.correlation_id
     result = envelope.payload
     if result.status == "failed" or not result.phases or result.project_duration_days is None:
-        await _mark_failed(asset_id, "plan", result.error)
+        log.error("plan normalization failed for asset %s: %s", asset_id, result.error)
+        async with SessionLocal() as db:
+            asset = await db.get(MediaAsset, asset_id)
+            if asset is not None:
+                asset.analysis_status = "failed"
+                await db.commit()
         return
 
     async with SessionLocal() as db:
@@ -250,10 +276,12 @@ async def handle_plan_result(envelope: Envelope[PlanNormalizeResult]) -> None:
 
 
 async def run_analysis(asset_id: uuid.UUID) -> None:
-    """Kick off one journal video's or photo's analysis: mark it in-flight and
-    publish the first pipeline command. The rest happens in handle_*_result
-    below, driven by messages coming back from the vision/phase/delay
-    services."""
+    """Kick off one file's equipment detection (vision) — publishes
+    `vision.command` and returns; `handle_vision_result` picks up from
+    there. The entry-level steps (visual_phase/phase/delay) are orchestrated
+    by `run_entry_analysis`/`_maybe_advance_entry`, not here — vision alone
+    still runs per file because detection is genuinely per-file work, while
+    the rest of the pipeline runs once for the whole entry."""
     async with SessionLocal() as db:
         asset = await db.get(MediaAsset, asset_id)
         if asset is None or asset.role not in ("journal_video", "journal_photo"):
@@ -270,58 +298,176 @@ async def run_analysis(asset_id: uuid.UUID) -> None:
     await broker.publish(broker.VISION_COMMAND, body)
 
 
+async def run_entry_analysis(entry_id: uuid.UUID) -> None:
+    """Kick off one journal entry's (one upload batch's) analysis: mark it
+    in-flight, start vision on every one of its files, and fire the one
+    visual_phase.command for the whole entry. `_maybe_advance_entry` (called
+    from `handle_vision_result`) fires the entry's one phase.command once
+    every file's vision result is in."""
+    async with SessionLocal() as db:
+        entry = (
+            await db.execute(
+                select(JournalEntry)
+                .where(JournalEntry.id == entry_id)
+                .options(selectinload(JournalEntry.media))
+            )
+        ).scalar_one_or_none()
+        if entry is None or not entry.media:
+            return
+        entry.analysis_status = "analyzing"
+        media = list(entry.media)
+        await db.commit()
+
+    for asset in media:
+        await run_analysis(asset.id)
+
+    # One representative file for the visual-phase signal, not one call per
+    # file voted together — see services/visual_phase/worker.py's docstring:
+    # its classifier is a coarse 8-cluster nearest-centroid model, not
+    # precise enough that averaging several photos' independent reads would
+    # meaningfully beat just reading one. A photo is a cleaner single-frame
+    # target than a video frame grab, so prefer one if the entry has any.
+    representative = next((a for a in media if a.kind == "image"), media[0])
+    visual_command = VisualPhaseCommand(
+        # Not a MediaAsset id here — the visual-phase result is entry-level,
+        # so this (and the envelope's correlation_id below) is the entry's
+        # id. The field only ever reaches this service's own logging.
+        asset_id=entry_id,
+        media_url=f"{settings.internal_url}/files/{representative.id}",
+        kind=representative.kind,
+    )
+    visual_body = _envelope(entry_id, visual_command).model_dump_json().encode()
+    await broker.publish(broker.VISUAL_PHASE_COMMAND, visual_body)
+
+
 async def handle_vision_result(envelope: Envelope[DetectResult]) -> None:
+    """Persists this one file's own equipment counts/status, then checks
+    whether its whole entry is now ready to advance to phase/delay — see
+    `_maybe_advance_entry`."""
     asset_id = envelope.correlation_id
     result = envelope.payload
-    if result.status == "failed":
-        await _mark_failed(asset_id, "vision", result.error)
-        return
 
-    counts = result.counts or []
     async with SessionLocal() as db:
         asset = await db.get(MediaAsset, asset_id)
         if asset is None:
             return
-        asset.equipment_summary = _summarize_equipment(counts)
-        entry = await db.get(JournalEntry, asset.entry_id) if asset.entry_id else None
-        # Which calendar day this video/photo's equipment counts belong to —
-        # shouldn't be missing (analysing a video means its entry already
-        # exists), but falls back to today rather than raising if it is.
-        obs_date = entry.date if entry is not None else date.today()
-        await _upsert_equipment_observation(db, asset.project_id, obs_date, counts)
-        plan = await _load_plan(db, asset.project_id)
-        history = await _load_equipment_history(db, asset.project_id)
+        entry_id = asset.entry_id
+        if result.status == "failed":
+            log.error("vision failed for asset %s: %s", asset_id, result.error)
+            asset.analysis_status = "failed"
+        else:
+            entry = await db.get(JournalEntry, entry_id) if entry_id else None
+            # Which calendar day this video/photo's equipment counts belong
+            # to — shouldn't be missing (a journal_video/photo always has an
+            # entry), but falls back to today rather than raising if it is.
+            obs_date = entry.date if entry is not None else date.today()
+            await _upsert_equipment_observation(db, asset.project_id, obs_date, result.counts or [])
+            asset.analysis_status = "ready"
+        await db.commit()
+
+    if entry_id is not None:
+        await _maybe_advance_entry(entry_id)
+
+
+async def _maybe_advance_entry(entry_id: uuid.UUID) -> None:
+    """Fires the entry's ONE phase.command once every one of its files has
+    reported its own vision result (ready or failed) — this is what turns
+    N files' worth of vision results back into a single combined phase call
+    instead of N redundant ones. Re-entrant and lock-free: harmless (if a
+    little wasteful) to call more than once for the same entry, since it
+    only acts while `analysis_status` is still "analyzing"; a rare race
+    between two files' results finishing at the same instant could still
+    fire phase.command twice with no lock around the check — that just means
+    two phase.result messages come back and the second one wins, consistent
+    with the at-least-once delivery every consumer here already has to
+    tolerate (see integrations/README.md)."""
+    async with SessionLocal() as db:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is None or entry.analysis_status != "analyzing":
+            return
+        assets = (
+            await db.execute(select(MediaAsset).where(MediaAsset.entry_id == entry_id))
+        ).scalars().all()
+        if not assets or any(a.analysis_status in ("pending", "analyzing") for a in assets):
+            return  # still waiting on some file's vision result
+        if all(a.analysis_status == "failed" for a in assets):
+            entry.analysis_status = "failed"
+            await db.commit()
+            log.error("all files failed vision for entry %s", entry_id)
+            return
+
+        obs = (
+            await db.execute(
+                select(EquipmentObservation).where(
+                    EquipmentObservation.project_id == entry.project_id,
+                    EquipmentObservation.date == entry.date,
+                )
+            )
+        ).scalar_one_or_none()
+        merged_counts = (
+            [EquipmentCount(equipment_class=cls, count=n) for cls, n in json.loads(obs.counts).items()]
+            if obs is not None
+            else []
+        )
+        entry.equipment_summary = _summarize_equipment(merged_counts)
+        plan = await _load_plan(db, entry.project_id)
+        history = await _load_equipment_history(db, entry.project_id)
+        as_of_date = entry.date
         await db.commit()
 
     command = PhaseCommand(
-        plan_stages=plan.phases if plan else [], history=history, as_of_date=obs_date
+        plan_stages=plan.phases if plan else [], history=history, as_of_date=as_of_date
     )
-    body = _envelope(asset_id, command).model_dump_json().encode()
+    body = _envelope(entry_id, command).model_dump_json().encode()
     await broker.publish(broker.PHASE_COMMAND, body)
 
 
-async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
-    asset_id = envelope.correlation_id
+async def handle_visual_phase_result(envelope: Envelope[VisualPhaseResult]) -> None:
+    """Persists services/visual_phase's result on the journal entry it was
+    computed for (`run_entry_analysis` fires exactly one visual_phase.command
+    per entry, against one representative file) — a plain observational
+    field, never marking the entry failed/ready and never touching
+    stage_summary or the delay forecast (see that service's module
+    docstring for why: its 8-cluster classifier only covers 4 of the 10
+    canonical phases, so it isn't fit to drive anything downstream yet). A
+    `failed` status or a missing phase_name here is just left unpersisted,
+    same as "no signal"."""
+    entry_id = envelope.correlation_id
     result = envelope.payload
     if result.status == "failed" or result.phase_name is None:
-        await _mark_failed(asset_id, "phase", result.error)
         return
 
     async with SessionLocal() as db:
-        asset = await db.get(MediaAsset, asset_id)
-        if asset is None:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is None:
             return
-        asset.stage_summary = _summarize_phase(result)
-        plan = await _load_plan(db, asset.project_id)
-        planned_start = await _project_planned_start(db, asset.project_id)
-        entry = await db.get(JournalEntry, asset.entry_id) if asset.entry_id else None
+        entry.visual_phase_name = result.phase_name
+        entry.visual_phase_confidence = result.confidence
+        await db.commit()
+
+
+async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
+    entry_id = envelope.correlation_id
+    result = envelope.payload
+    if result.status == "failed" or result.phase_name is None:
+        await _mark_entry_failed(entry_id, "phase", result.error)
+        return
+
+    async with SessionLocal() as db:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is None:
+            return
+        entry.stage_summary = _summarize_phase(result)
+        plan = await _load_plan(db, entry.project_id)
+        planned_start = await _project_planned_start(db, entry.project_id)
+        as_of_date = entry.date
         await db.commit()
 
     if planned_start is None:
         # No plan-stage math possible without a start anchor — same
         # "nothing to forecast from" outcome as an empty plan.
         await handle_delay_result(
-            _envelope(asset_id, DelayForecastResult(status="done", confidence=result.confidence))
+            _envelope(entry_id, DelayForecastResult(status="done", confidence=result.confidence))
         )
         return
 
@@ -330,33 +476,33 @@ async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
         planned_start=planned_start,
         project_duration_days=plan.project_duration_days if plan else None,
         current_phase=result.phase_name,
-        as_of_date=entry.date if entry is not None else date.today(),
+        as_of_date=as_of_date,
         phase_confidence=result.confidence if result.confidence is not None else 1.0,
     )
-    body = _envelope(asset_id, command).model_dump_json().encode()
+    body = _envelope(entry_id, command).model_dump_json().encode()
     await broker.publish(broker.DELAY_COMMAND, body)
 
 
 async def handle_delay_result(envelope: Envelope[DelayForecastResult]) -> None:
-    asset_id = envelope.correlation_id
+    entry_id = envelope.correlation_id
     result = envelope.payload
     if result.status == "failed":
-        await _mark_failed(asset_id, "delay", result.error)
+        await _mark_entry_failed(entry_id, "delay", result.error)
         return
 
     async with SessionLocal() as db:
-        asset = await db.get(MediaAsset, asset_id)
-        if asset is None:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is None:
             return
-        asset.stage_summary = _summarize_delay(asset.stage_summary, result)
-        asset.analysis_status = "ready"
-        asset.analyzed_at = datetime.now(timezone.utc)
-        await _refresh_plan_status(db, asset.project_id)
+        entry.stage_summary = _summarize_delay(entry.stage_summary, result)
+        entry.analysis_status = "ready"
+        entry.analyzed_at = datetime.now(timezone.utc)
+        await _refresh_plan_status(db, entry.project_id)
         await db.commit()
 
 
 async def start_consumers() -> None:
-    """Wire up the backend's four result consumers. Called once from
+    """Wire up the backend's five result consumers. Called once from
     main.py's lifespan on startup."""
 
     async def _plan(body: bytes) -> None:
@@ -364,6 +510,9 @@ async def start_consumers() -> None:
 
     async def _vision(body: bytes) -> None:
         await handle_vision_result(Envelope[DetectResult].model_validate_json(body))
+
+    async def _visual_phase(body: bytes) -> None:
+        await handle_visual_phase_result(Envelope[VisualPhaseResult].model_validate_json(body))
 
     async def _phase(body: bytes) -> None:
         await handle_phase_result(Envelope[PhaseResult].model_validate_json(body))
@@ -373,19 +522,28 @@ async def start_consumers() -> None:
 
     await broker.start_consumer(broker.PLAN_RESULT, _plan)
     await broker.start_consumer(broker.VISION_RESULT, _vision)
+    await broker.start_consumer(broker.VISUAL_PHASE_RESULT, _visual_phase)
     await broker.start_consumer(broker.PHASE_RESULT, _phase)
     await broker.start_consumer(broker.DELAY_RESULT, _delay)
 
 
-def schedule_analysis(background: BackgroundTasks, asset_id: uuid.UUID) -> None:
-    """Queue analysis to run after the current response is sent."""
-    background.add_task(run_analysis, asset_id)
+def schedule_entry_analysis(background: BackgroundTasks, entry_id: uuid.UUID) -> None:
+    """Queue a journal entry's analysis to run after the current response is sent."""
+    background.add_task(run_entry_analysis, entry_id)
 
 
 async def requeue_pending() -> None:
-    """On startup, resume analyses left `pending`/`analyzing` by a restart."""
+    """On startup, resume analyses left in flight by a restart: entries never
+    even started (`run_entry_analysis` never ran), individual files still
+    mid-vision, and entries whose files are all done but that never (or not
+    yet) advanced past "analyzing" — the last case just re-runs
+    `_maybe_advance_entry`, which re-publishes phase.command if needed; see
+    that function's docstring for why doing so twice is harmless."""
     async with SessionLocal() as db:
-        rows = (
+        pending_entries = (
+            await db.execute(select(JournalEntry.id).where(JournalEntry.analysis_status == "pending"))
+        ).scalars().all()
+        stuck_assets = (
             await db.execute(
                 select(MediaAsset.id).where(
                     MediaAsset.role.in_(("journal_video", "journal_photo")),
@@ -393,5 +551,13 @@ async def requeue_pending() -> None:
                 )
             )
         ).scalars().all()
-    for asset_id in rows:
+        analyzing_entries = (
+            await db.execute(select(JournalEntry.id).where(JournalEntry.analysis_status == "analyzing"))
+        ).scalars().all()
+
+    for entry_id in pending_entries:
+        asyncio.create_task(run_entry_analysis(entry_id))
+    for asset_id in stuck_assets:
         asyncio.create_task(run_analysis(asset_id))
+    for entry_id in analyzing_entries:
+        asyncio.create_task(_maybe_advance_entry(entry_id))

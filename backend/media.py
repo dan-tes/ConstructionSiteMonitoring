@@ -105,21 +105,15 @@ def file_url(asset_id: uuid.UUID) -> str:
 
 def asset_to_file_out(asset: MediaAsset, *, with_insight: bool = False) -> ProjectFileOut:
     insight = None
-    if with_insight and asset.role in ("journal_video", "journal_photo"):
-        ready = asset.analysis_status == "ready"
-        insight = VideoInsightOut(
-            status=asset.analysis_status,
-            stage_summary=asset.stage_summary if ready else None,
-            equipment_summary=asset.equipment_summary if ready else None,
-            photos=[],  # frame extraction not implemented yet
-        )
-    elif with_insight and asset.role == "plan":
+    if with_insight and asset.role == "plan":
         # Reused for the plan's own async step: canonical-workbook parsing is
         # synchronous (status goes straight to "ready"/"failed" at upload
         # time), but a plan that needed the LLM fallback sits at "analyzing"
         # until the planner service's result comes back — see
         # routers/projects.py's upload_plan and analysis.py's
-        # handle_plan_result.
+        # handle_plan_result. A journal_video/journal_photo asset never gets
+        # an insight of its own — see entry_to_out, analysis is combined per
+        # upload batch (JournalEntry), not per individual file.
         insight = VideoInsightOut(status=asset.analysis_status)
     return ProjectFileOut(
         id=str(asset.id),
@@ -133,12 +127,22 @@ def asset_to_file_out(asset: MediaAsset, *, with_insight: bool = False) -> Proje
 
 
 def entry_to_out(entry: JournalEntry) -> JournalEntryOut:
+    ready = entry.analysis_status == "ready"
+    insight = VideoInsightOut(
+        status=entry.analysis_status,
+        stage_summary=entry.stage_summary if ready else None,
+        equipment_summary=entry.equipment_summary if ready else None,
+        photos=[],  # frame extraction not implemented yet
+        visual_phase_name=entry.visual_phase_name,
+        visual_phase_confidence=entry.visual_phase_confidence,
+    )
     return JournalEntryOut(
         id=entry.id,
         comment=entry.comment,
         author=entry.author,
         date=entry.date,
-        media=[asset_to_file_out(a, with_insight=True) for a in entry.media],
+        media=[asset_to_file_out(a) for a in entry.media],
+        insight=insight,
     )
 
 

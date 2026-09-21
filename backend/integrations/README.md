@@ -12,17 +12,22 @@ Earned-Schedule model actually forecasting against the uploaded plan. Each
 service's module docstring (`services/*/worker.py`) spells out where its
 live-inference input still differs from what it saw at training time —
 that's a modeling simplification, not a stub; see *Open items* for what
-would close the gap.
+would close the gap. **visual_phase** is the one exception worth flagging up
+front: it's real, wired code too (not a stub), but its classifier is
+explicitly experimental and only covers 4 of the 10 canonical phases — see
+the Services section and `services/visual_phase/worker.py`'s docstring
+before treating its output as equivalent to `phase`'s.
 
 ## Services
 
-Four services sit behind the backend, which is the pipeline's orchestrator
+Five services sit behind the backend, which is the pipeline's orchestrator
 (it decides what runs next; it never calls a service directly):
 
 | Service | Diagram block | Responsibility |
 | --- | --- | --- |
-| **planner** | 1 — план объекта (LLM fallback) | Given a free-form uploaded plan the canonical parser rejected, re-expresses it onto the 10 canonical phases via an LLM |
+| **planner** | 1 — план объекта (LLM fallback) | Given a free-form uploaded plan the canonical parser rejected, classifies it activity-by-activity onto a 43-item closed vocabulary (`services/planner/data/canonical_plan.xlsx`) via `plan_normalizer.py`, then aggregates onto the 10 canonical phases |
 | **vision** | 2 — детекция и подсчёт | Runs YOLO over an uploaded video/photo, counts equipment on site by class |
+| **visual_phase** | extra, alongside 3 | Reads the construction phase directly off a photo/video frame via an unsupervised visual classifier — no equipment detection involved. Runs in parallel with vision/phase/delay, not as a step in that chain; see below |
 | **phase** | 3 — понять фазу проекта | Given the plan schedule + equipment counts, decides the current construction phase |
 | **delay** | 4 — прогноз отставания | Given the plan schedule + current phase + today's date, forecasts schedule lag |
 
@@ -37,13 +42,48 @@ never needs to know which one a given project's plan took:
   in the `upload_plan` request itself, no fuzzy column matching.
 - **LLM fallback** (`planner` service, `plan.command`/`plan.result`): anything
   that doesn't parse as canonical (any `.csv`/`.xls`, or an `.xlsx` with the
-  wrong shape) goes to an LLM instead, which re-expresses the free-form
-  plan's own phases/work items onto 10 empirically-derived canonical phases
-  (see `services/planner/data/phase_equipment_reference.csv` and that
-  service's module docstring). Unlike the fast path this is async — plan
+  wrong shape) goes through `plan_normalizer.py` instead
+  (`services/planner/plan_normalizer.py`): an LLM only does the two things
+  that need "meaning" — finding which column in the free-form source table
+  holds what, and classifying each row's own work item into a CLOSED
+  43-activity vocabulary (`services/planner/data/canonical_plan.xlsx`,
+  activity -> phase -> expected equipment) — while ordinary code does
+  everything else (units, durations, validation, phase aggregation). This
+  replaced an earlier design that asked the model to guess whole-phase
+  durations directly from a single prompt; classifying per activity and
+  summing in code is both more accurate and auditable
+  (`plan_normalizer.normalize()`'s per-row log explains every row's fate).
+  The one thing this classifier can't derive — the overall project
+  critical-path duration, since a free-form plan has no dependency graph —
+  is still a single, narrow LLM estimate (`worker.py`'s
+  `_estimate_project_duration`). Unlike the fast path this is async — plan
   upload returns immediately with the plan asset's `analysis_status` at
   `"analyzing"`, same lifecycle as a video/photo, and the frontend polls for
   `"ready"`/`"failed"`.
+
+**visual_phase** (`visual_phase.command`/`visual_phase.result`) stands apart
+from the vision→phase→delay chain the same way plan's fast/LLM paths stand
+apart from each other: `run_entry_analysis()` fires one `visual_phase.command`
+per journal entry, against one representative file (see `analysis.py`), and
+its result is just persisted (`JournalEntry.visual_phase_name`/
+`visual_phase_confidence`) by `handle_visual_phase_result` — it never
+blocks, gates or feeds `phase`'s or `delay`'s commands. That's deliberate,
+not a missing wire-up: the model
+behind it (`services/visual_phase/model.py` — a DINOv2 backbone
+self-supervised fine-tuned on ~10k unlabeled site photos, see
+`phase_determination/visual_state_pretraining.ipynb`) has no labeled
+phase data to learn from, so its classifier is 8 k-means clusters over the
+resulting embeddings, hand-labeled by inspecting each cluster's closest
+photos (`phase_determination/build_visual_phase_classifier.py`). That photo
+set itself skews toward earthwork/foundation/structural-frame scenes, so the
+8 clusters only ever land on 4 of the 10 canonical phases (Earthwork,
+Foundation, Structural Frame, External Works) — a photo from any of the
+other six phases still gets forced onto whichever of those 4 looks closest,
+because there's no "unknown" class. Treat it as a secondary, experimental
+signal shown next to the real (equipment-based) phase result, not a
+replacement for it — see `services/visual_phase/worker.py`'s docstring for
+the full reasoning and *Open items* below for what it would take to close
+the coverage gap.
 
 Blocks 5/6 (GPT summaries) aren't started — see *Open items* below.
 
@@ -74,6 +114,10 @@ primitive, so every step — slow or fast — looks the same on the wire.
    backend  ──vision.command──▶  vision.command.q   ──▶ vision service
    backend  ◀──vision.result──   backend.vision.result.q  ◀── vision service
 
+   backend  ──visual_phase.command──▶  visual_phase.command.q   ──▶ visual_phase service
+   backend  ◀──visual_phase.result──   backend.visual_phase.result.q  ◀── visual_phase service
+   (fired alongside vision.command, not chained after it — see below)
+
    backend  ──phase.command──▶  phase.command.q     ──▶ phase service
    backend  ◀──phase.result──   backend.phase.result.q   ◀── phase service
 
@@ -81,43 +125,61 @@ primitive, so every step — slow or fast — looks the same on the wire.
    backend  ◀──delay.result──   backend.delay.result.q   ◀── delay service
 ```
 
-`plan.command`/`plan.result` stand apart from the other three: they're not
-part of `run_analysis()`'s per-video choreography, but a one-off triggered
-from `upload_plan` (routers/projects.py) whenever the fast path
+`plan.command`/`plan.result` stand apart from the other four: they're not
+part of `run_entry_analysis()`'s per-entry choreography, but a one-off
+triggered from `upload_plan` (routers/projects.py) whenever the fast path
 (`plan_parser.py`) can't parse what was uploaded. `handle_plan_result` in
 `analysis.py` persists the outcome to `PlanStage` the same way the fast path
 does, and that's the end of it — no further command follows.
 
-`run_analysis()` itself becomes a choreography driven by result messages
-rather than a straight-line `await` chain: publish `vision.command` → on
-`vision.result` persist equipment counts and publish `phase.command` → on
-`phase.result` persist the phase and publish `delay.command` → on
-`delay.result` persist the forecast and move on to GPT summaries (blocks
-5/6, TBD). Each stage transition happens in the backend's result consumer,
-keyed by `correlation_id`.
+A journal entry (`JournalEntry` — the photos/videos one site-visit upload
+produced, together) is where the choreography starts, and it runs once for
+the WHOLE entry, not once per file: vision is the one exception, since
+equipment detection is genuinely per-file work. `run_entry_analysis()`
+publishes one `vision.command` per file in the entry (plus the entry's one
+`visual_phase.command`, see above) → each file's own `vision.result`
+persists that file's equipment counts and marks that file's own status; once
+every file in the entry has reported in, `_maybe_advance_entry()` publishes
+the entry's ONE `phase.command` off the combined counts → on `phase.result`
+persist the phase and publish the entry's ONE `delay.command` → on
+`delay.result` persist the forecast, mark the entry `ready`, and move on to
+GPT summaries (blocks 5/6, TBD). `visual_phase.result` is consumed
+independently and just persists its two fields, on its own schedule,
+whenever it arrives. Each stage transition happens in the backend's result
+consumer, keyed by `correlation_id` — the entry's id for
+visual_phase/phase/delay, but the individual file's id for vision (see the
+`correlation_id` design-decision bullet below).
+
+This replaced an earlier design where phase/delay (and the original,
+per-file visual_phase) ran once per individual photo/video: three photos
+uploaded together used to fire three separate, slightly-redundant phase
+calls instead of the one phase the site visit actually represents.
 
 ### Topology
 
 - **Exchange**: `csm.analysis`, topic, durable.
 - **Routing keys**: `plan.command`, `plan.result`, `vision.command`,
-  `vision.result`, `phase.command`, `phase.result`, `delay.command`,
-  `delay.result`.
+  `vision.result`, `visual_phase.command`, `visual_phase.result`,
+  `phase.command`, `phase.result`, `delay.command`, `delay.result`.
 - **Queues**: one per consumer — `vision.command.q` (bound to
   `vision.command`, consumed by the vision service), `backend.vision.result.q`
   (bound to `vision.result`, consumed by the backend), and the same pair for
-  phase/delay. Splitting command and result queues per step, rather than one
-  shared queue, means each service only ever sees the messages meant for it.
+  visual_phase/phase/delay. Splitting command and result queues per step,
+  rather than one shared queue, means each service only ever sees the
+  messages meant for it.
 - All queues durable, messages published persistent, publisher confirms on.
 - Backend and service consumers ack only after their own write (DB commit /
   result publish) succeeds — at-least-once delivery, so every consumer
-  handler must be idempotent on `correlation_id` (e.g. skip if that asset's
+  handler must be idempotent on `correlation_id` (e.g. skip if that entry's
   phase is already recorded for this run).
 
 ### Message envelope
 
-Every message is `Envelope[T]` (see `schemas.py`): `correlation_id` (the
-`MediaAsset.id` this run belongs to), `published_at`, and `payload`. The
-payload is one of the `*Command`/`*Result` models. A `*Result.status` of
+Every message is `Envelope[T]` (see `schemas.py`): `correlation_id` (a
+`MediaAsset.id` for `plan`/`vision`, a `JournalEntry.id` for
+`visual_phase`/`phase`/`delay` — see the `correlation_id` design-decision
+bullet below), `published_at`, and `payload`. The payload is one of the
+`*Command`/`*Result` models. A `*Result.status` of
 `"failed"` (with `error` set) is how a service reports its own failure back
 through the same channel — the backend's result consumer treats that the
 same way `analysis_status = "failed"` works today, no separate error path.
@@ -175,11 +237,27 @@ same way `analysis_status = "failed"` works today, no separate error path.
   `services/phase/worker.py`'s docstring.
 - **Backend owns persistence.** Services are stateless message handlers; the
   equipment counts and the phase/delay results are stored on
-  `MediaAsset`/`Project`/`EquipmentObservation` by the backend (see
-  `models.py`), not by the services themselves.
-- **`correlation_id` is the `MediaAsset.id`.** One analysis run == one
-  uploaded journal video, so the asset's own id is a sufficient join key
-  across all three result queues; no separate run-id table needed.
+  `MediaAsset`/`JournalEntry`/`Project`/`EquipmentObservation` by the
+  backend (see `models.py`), not by the services themselves.
+- **`correlation_id` is the file's id for vision, the entry's id for
+  everything else.** Equipment detection is genuinely per-file work, so
+  `vision.command`/`vision.result` are keyed by `MediaAsset.id` — the join
+  key `handle_vision_result` uses to persist that file's own status and
+  counts, and to know (via `_maybe_advance_entry`) when every file in an
+  entry has reported in. `visual_phase`/`phase`/`delay` are keyed by
+  `JournalEntry.id` instead, since their result is one combined answer for
+  the whole entry, not one per file — no separate run-id table needed for
+  either.
+- **visual_phase over the same broker, same envelope shape, fired in
+  parallel rather than chained.** Still one connection style for every
+  service (`consistent-service-integration-pattern` — queue everywhere,
+  never bolt on a direct call for the new one), but a *parallel* leg rather
+  than an extra link in the vision→phase→delay chain, because its result
+  isn't trustworthy enough yet to gate anything downstream — see the
+  Services section above and `services/visual_phase/worker.py`'s docstring.
+  If its classifier ever gets real coverage of all 10 phases, promoting it
+  into (or blending it with) the equipment-based `phase` step is the
+  natural next move; today it's deliberately a sidecar, not a dependency.
 
 ## Open items
 
@@ -244,6 +322,28 @@ same way `analysis_status = "failed"` works today, no separate error path.
   numbers — not a pattern any real project produces) still drifts back
   toward `"MEP"`, so this is a real improvement on realistic inputs, not a
   guarantee against every synthetic edge case.
+- **visual_phase**: the 8-cluster classifier covers only 4 of the 10
+  canonical phases (see above) — closing this needs either more/better-
+  distributed unlabeled photos across all 10 phases before reclustering
+  (`phase_determination/build_visual_phase_classifier.py`), or real labels
+  (steps 2-3 the pretraining notebook's own "Дальше" section sketches:
+  zero-shot vision-language pseudo-labeling, or weak labels from a project's
+  own plan dates) feeding an actual trained classification head instead of
+  nearest-centroid. Until then this stays a secondary signal, not something
+  `phase`/`delay` should ever read.
+- **visual_phase**: `weights/backbone_best.pt` (~250MB) is gitignored the
+  same way `services/vision/weights/best.pt` already is — too large to
+  commit — so a fresh checkout needs it copied in manually from
+  `phase_determination/visual_pretraining_checkpoints/best.pt` before
+  `docker compose build visual_phase` will produce a working image.
+  `weights/classifier.json` (the cluster centroids + phase labels, small) is
+  committed normally.
+- **visual_phase**: no history kept — each new result overwrites
+  `JournalEntry.visual_phase_name`/`visual_phase_confidence` for that entry,
+  there's no per-project trend the way `EquipmentObservation` gives the
+  equipment-based phase model. Not needed for a one-photo-per-entry signal
+  today, but worth knowing before building anything that expects a time
+  series out of it.
 - **delay**: `current_phase_started_at` is simplified to `planned_start +`
   the matched phase's offset (assumes the phase started on time) — there's
   no history of when the phase detector *itself* first reported the current
@@ -263,21 +363,29 @@ same way `analysis_status = "failed"` works today, no separate error path.
 - Block 1 LLM fallback (`services/planner`): only handles a *table* upload
   (`.csv`/`.xlsx`/`.xls` — what `is_allowed_plan` in `media.py` already
   restricts to), not an arbitrary document like a PDF or a scanned image of
-  a Gantt chart; there's no OCR/document-layout step. A row cap
-  (`MAX_SOURCE_ROWS`) truncates an unusually large source table rather than
-  chunking it, so a plan with far more than 500 line items loses whatever's
-  past the cut. No retry/self-correction loop on a malformed model
-  response — one bad JSON response is one `failed` result, not a re-prompt.
+  a Gantt chart; there's no OCR/document-layout step. `plan_normalizer.py`'s
+  own classification stage does retry/self-correct on a malformed or
+  incomplete batch response (up to 3 passes, see `normalize()`), but the
+  structure-detection stage forwards only the first 30 rows to the model, and
+  the separate `_estimate_project_duration` call (`MAX_SOURCE_ROWS`)
+  truncates an unusually large source table rather than chunking it, so a
+  plan with far more than 500 line items loses whatever's past the cut for
+  that one estimate.
+- `services/planner/data/phase_equipment_reference.csv` is unused now that
+  `plan_normalizer.py` sources its activity → phase → equipment mapping from
+  `canonical_plan.xlsx` instead; left in place rather than deleted in case
+  anything else still reads it.
 - Blocks 5/6: GPT contracts for the per-video report and the project-level
   status summary — likely in-process calls (already outside the broker
   pipeline, since nothing calls them as a service), but not yet specced.
-- No new columns/migration added: `handle_phase_result`/`handle_delay_result`
-  currently render `PhaseResult`/`DelayForecastResult` straight into the
-  existing `stage_summary` text column instead of storing `current_phase`,
-  `delay_days`, etc. as structured fields. Fine while the frontend only ever
-  displays that text, but if a screen needs the phase name or delay-days
-  number on their own later, that's an Alembic migration (`PlanStage` table,
-  `MediaAsset.equipment` too, for the same reason on the vision side).
+- No structured phase/delay columns: `handle_phase_result`/`handle_delay_result`
+  still render `PhaseResult`/`DelayForecastResult` straight into
+  `JournalEntry.stage_summary`, one text blob, instead of storing
+  `current_phase`, `delay_days`, etc. as their own fields (unlike
+  `visual_phase_name`/`visual_phase_confidence`, which did get real
+  columns). Fine while the frontend only ever displays that text, but if a
+  screen needs the phase name or delay-days number on their own later,
+  that's another Alembic migration.
 - Dead-letter handling: a poison message (a handler that keeps failing) has
   no defined destination yet — likely a per-queue DLX once implementation
   starts, not designed in detail here.

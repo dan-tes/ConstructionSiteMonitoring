@@ -26,6 +26,8 @@ PLAN_COMMAND = "plan.command"
 PLAN_RESULT = "plan.result"
 VISION_COMMAND = "vision.command"
 VISION_RESULT = "vision.result"
+VISUAL_PHASE_COMMAND = "visual_phase.command"
+VISUAL_PHASE_RESULT = "visual_phase.result"
 PHASE_COMMAND = "phase.command"
 PHASE_RESULT = "phase.result"
 DELAY_COMMAND = "delay.command"
@@ -38,6 +40,8 @@ QUEUE_NAMES: dict[str, str] = {
     PLAN_RESULT: "backend.plan.result.q",
     VISION_COMMAND: "vision.command.q",
     VISION_RESULT: "backend.vision.result.q",
+    VISUAL_PHASE_COMMAND: "visual_phase.command.q",
+    VISUAL_PHASE_RESULT: "backend.visual_phase.result.q",
     PHASE_COMMAND: "phase.command.q",
     PHASE_RESULT: "backend.phase.result.q",
     DELAY_COMMAND: "delay.command.q",
