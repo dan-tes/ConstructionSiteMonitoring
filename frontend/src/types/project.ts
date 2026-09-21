@@ -24,6 +24,18 @@ export interface VideoInsight {
   equipmentSummary?: string
   /** Frames pulled from the video showing machinery or notable events. May be empty. */
   photos?: ProjectFile[]
+  /**
+   * Experimental secondary signal: phase read directly off the footage by a
+   * visual classifier (no equipment detection involved), independent of
+   * `status`/`stageSummary` — may be set before `status` is `ready`, or stay
+   * unset after. Only ever one of Earthwork/Foundation/Structural Frame/
+   * External Works — the classifier has no training coverage for the other
+   * six canonical phases, so don't treat a missing value as "not started
+   * yet" the way you would for stageSummary.
+   */
+  visualPhaseName?: string
+  /** Relative confidence among the classifier's clusters, not a calibrated probability. */
+  visualPhaseConfidence?: number
 }
 
 export interface JournalEntry {

@@ -1,4 +1,4 @@
-import { ArrowLeft, Cpu, HardHat, Loader2, Truck } from 'lucide-react'
+import { ArrowLeft, Cpu, Eye, HardHat, Loader2, Truck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useParams } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
@@ -153,6 +153,29 @@ export function VideoDetailPage() {
                     {insight?.equipmentSummary}
                   </p>
                 </section>
+
+                {insight?.visualPhaseName && (
+                  <section className="mt-4 rounded-2xl border border-site-700 bg-site-900/50 p-5">
+                    <div className="flex items-center gap-2.5">
+                      <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-site-800 text-safety-400">
+                        <Eye className="h-4.5 w-4.5" strokeWidth={1.75} />
+                      </span>
+                      <h2 className="font-display text-lg font-semibold text-site-100">
+                        Этап по фото (эксперимент)
+                      </h2>
+                    </div>
+                    <p className="mt-3 text-sm leading-relaxed text-site-300">
+                      {insight.visualPhaseName}
+                      {typeof insight.visualPhaseConfidence === 'number' &&
+                        ` (${Math.round(insight.visualPhaseConfidence * 100)}%)`}
+                    </p>
+                    <p className="mt-2 text-xs leading-relaxed text-site-500">
+                      Отдельная визуальная модель определяет этап прямо по кадру, без учёта
+                      техники. Пока распознаёт не все этапы — используйте как дополнительную
+                      подсказку, а не как основной результат.
+                    </p>
+                  </section>
+                )}
 
                 {photos.length > 0 && (
                   <section className="mt-4 rounded-2xl border border-site-700 bg-site-900/50 p-5">

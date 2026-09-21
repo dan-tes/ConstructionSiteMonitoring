@@ -148,6 +148,11 @@ class MediaAsset(Base):
     equipment_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Visual-phase signal (services/visual_phase) — observational only, does
+    # not feed the delay forecast; see analysis.py's handle_visual_phase_result.
+    visual_phase_name: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    visual_phase_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     project: Mapped[Project] = relationship(back_populates="assets")
     entry: Mapped["JournalEntry | None"] = relationship(back_populates="media")
     # NOTE: extracted frames (role == 'frame', source_asset_id set) are not

@@ -89,6 +89,15 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  visual_phase:
+    build: ../services/visual_phase
+    container_name: csm-visual-phase
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
   phase:
     build: ../services/phase
     container_name: csm-phase

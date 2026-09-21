@@ -21,6 +21,7 @@ from integrations.schemas import (
     NormalizedPhase,
     PhaseResult,
     PlanNormalizeResult,
+    VisualPhaseResult,
 )
 from main import app
 
@@ -59,6 +60,15 @@ async def _fake_publish(routing_key: str, body: bytes) -> None:
             counts=[EquipmentCount(equipment_class="excavator", count=1)],
         )
         await analysis.handle_vision_result(
+            Envelope(
+                correlation_id=correlation_id,
+                published_at=datetime.now(timezone.utc),
+                payload=result,
+            )
+        )
+    elif routing_key == broker.VISUAL_PHASE_COMMAND:
+        result = VisualPhaseResult(status="done", phase_name="Earthwork", confidence=0.7, cluster_id=1)
+        await analysis.handle_visual_phase_result(
             Envelope(
                 correlation_id=correlation_id,
                 published_at=datetime.now(timezone.utc),

@@ -1,10 +1,12 @@
 """Message contracts for the internal analysis pipeline.
 
-Three services sit behind the backend orchestrator (see analysis.py):
-vision (equipment detection), phase (current project phase) and delay
-(schedule-lag forecast). All inter-service communication goes over a single
-RabbitMQ exchange — no direct HTTP calls between backend and services, for
-any step, including the fast ones. See ../integrations/README.md for why.
+Five services sit behind the backend orchestrator (see analysis.py):
+planner (plan normalization), vision (equipment detection), visual_phase
+(phase read directly off a photo, experimental/secondary), phase (current
+project phase) and delay (schedule-lag forecast). All inter-service
+communication goes over a single RabbitMQ exchange — no direct HTTP calls
+between backend and services, for any step, including the fast ones. See
+../integrations/README.md for why.
 
 Every message on the bus is an `Envelope[T]`: a thin wrapper carrying a
 `correlation_id` (the `MediaAsset.id` the message belongs to) around one of
@@ -74,6 +76,27 @@ class DetectResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Visual phase — construction phase read directly off a photo, no equipment
+# detection in between (extra leg alongside block 3; see services/visual_phase
+# and backend/integrations/README.md for why this is a separate, additional
+# signal rather than a replacement for the equipment-based `phase` service).
+# routing keys: visual_phase.command / visual_phase.result
+# ---------------------------------------------------------------------------
+class VisualPhaseCommand(BaseModel):
+    asset_id: uuid.UUID
+    media_url: str
+    kind: Literal["video", "image"]
+
+
+class VisualPhaseResult(BaseModel):
+    status: Literal["done", "failed"]
+    phase_name: str | None = None
+    confidence: float | None = None
+    cluster_id: int | None = None
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Shared plan-phase shape (block 1 output, consumed by phase & delay).
 #
 # Matches the canonical plan format (see
@@ -98,11 +121,11 @@ class PlanPhaseIn(BaseModel):
 # plan_parser.py only accepts an already-canonical workbook (exact 21-column
 # header) — most uploaded plans (an MS Project/Primavera/Excel export with
 # its own column names and work-item names) aren't in that shape. This is
-# the fallback for those: an LLM re-expresses the free-form plan onto the 10
-# canonical phases below, which were derived empirically (see
-# phase_determination/data/phase_equipment_reference.csv — phase → expected
-# equipment, presence rate and typical count, fed into the model's prompt as
-# a closed vocabulary instead of letting it invent phase names).
+# the fallback for those: services/planner/plan_normalizer.py classifies the
+# free-form plan activity-by-activity onto a closed 43-activity vocabulary
+# (services/planner/data/canonical_plan.xlsx — activity → phase → expected
+# equipment, an empirical reference instead of letting the model invent
+# names), then aggregates onto the 10 canonical phases below in code.
 # ---------------------------------------------------------------------------
 CANONICAL_PHASES: tuple[str, ...] = (
     "Preconstruction",

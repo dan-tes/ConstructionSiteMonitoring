@@ -112,6 +112,8 @@ def asset_to_file_out(asset: MediaAsset, *, with_insight: bool = False) -> Proje
             stage_summary=asset.stage_summary if ready else None,
             equipment_summary=asset.equipment_summary if ready else None,
             photos=[],  # frame extraction not implemented yet
+            visual_phase_name=asset.visual_phase_name,
+            visual_phase_confidence=asset.visual_phase_confidence,
         )
     elif with_insight and asset.role == "plan":
         # Reused for the plan's own async step: canonical-workbook parsing is

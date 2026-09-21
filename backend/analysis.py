@@ -56,6 +56,8 @@ from integrations.schemas import (
     PhaseResult,
     PlanNormalizeResult,
     PlanPhaseIn,
+    VisualPhaseCommand,
+    VisualPhaseResult,
 )
 from models import EquipmentObservation, JournalEntry, MediaAsset, PlanStage, Project
 from plan_parser import ParsedPlan
@@ -261,13 +263,19 @@ async def run_analysis(asset_id: uuid.UUID) -> None:
         asset.analysis_status = "analyzing"
         await db.commit()
 
-    command = DetectCommand(
-        asset_id=asset_id,
-        media_url=f"{settings.internal_url}/files/{asset_id}",
-        kind=asset.kind,
-    )
+    media_url = f"{settings.internal_url}/files/{asset_id}"
+
+    command = DetectCommand(asset_id=asset_id, media_url=media_url, kind=asset.kind)
     body = _envelope(asset_id, command).model_dump_json().encode()
     await broker.publish(broker.VISION_COMMAND, body)
+
+    # Runs alongside the vision->phase->delay chain, not as a step in it —
+    # see handle_visual_phase_result and services/visual_phase/worker.py's
+    # module docstring for why this signal doesn't gate/feed the rest of the
+    # pipeline the way the equipment-based phase result does.
+    visual_command = VisualPhaseCommand(asset_id=asset_id, media_url=media_url, kind=asset.kind)
+    visual_body = _envelope(asset_id, visual_command).model_dump_json().encode()
+    await broker.publish(broker.VISUAL_PHASE_COMMAND, visual_body)
 
 
 async def handle_vision_result(envelope: Envelope[DetectResult]) -> None:
@@ -298,6 +306,27 @@ async def handle_vision_result(envelope: Envelope[DetectResult]) -> None:
     )
     body = _envelope(asset_id, command).model_dump_json().encode()
     await broker.publish(broker.PHASE_COMMAND, body)
+
+
+async def handle_visual_phase_result(envelope: Envelope[VisualPhaseResult]) -> None:
+    """Persists services/visual_phase's result as a plain observational field
+    — never marks the asset failed/ready and never touches stage_summary or
+    the delay forecast (see that service's module docstring for why: its
+    8-cluster classifier only covers 4 of the 10 canonical phases, so it
+    isn't fit to drive anything downstream yet). A `failed` status or a
+    missing phase_name here is just left unpersisted, same as "no signal"."""
+    asset_id = envelope.correlation_id
+    result = envelope.payload
+    if result.status == "failed" or result.phase_name is None:
+        return
+
+    async with SessionLocal() as db:
+        asset = await db.get(MediaAsset, asset_id)
+        if asset is None:
+            return
+        asset.visual_phase_name = result.phase_name
+        asset.visual_phase_confidence = result.confidence
+        await db.commit()
 
 
 async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
@@ -356,7 +385,7 @@ async def handle_delay_result(envelope: Envelope[DelayForecastResult]) -> None:
 
 
 async def start_consumers() -> None:
-    """Wire up the backend's four result consumers. Called once from
+    """Wire up the backend's five result consumers. Called once from
     main.py's lifespan on startup."""
 
     async def _plan(body: bytes) -> None:
@@ -364,6 +393,9 @@ async def start_consumers() -> None:
 
     async def _vision(body: bytes) -> None:
         await handle_vision_result(Envelope[DetectResult].model_validate_json(body))
+
+    async def _visual_phase(body: bytes) -> None:
+        await handle_visual_phase_result(Envelope[VisualPhaseResult].model_validate_json(body))
 
     async def _phase(body: bytes) -> None:
         await handle_phase_result(Envelope[PhaseResult].model_validate_json(body))
@@ -373,6 +405,7 @@ async def start_consumers() -> None:
 
     await broker.start_consumer(broker.PLAN_RESULT, _plan)
     await broker.start_consumer(broker.VISION_RESULT, _vision)
+    await broker.start_consumer(broker.VISUAL_PHASE_RESULT, _visual_phase)
     await broker.start_consumer(broker.PHASE_RESULT, _phase)
     await broker.start_consumer(broker.DELAY_RESULT, _delay)
 

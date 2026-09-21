@@ -72,6 +72,14 @@ class VideoInsightOut(CamelModel):
     stage_summary: str | None = None
     equipment_summary: str | None = None
     photos: list[ProjectFileOut] = []
+    # Experimental, observational-only signal from services/visual_phase —
+    # arrives independently of `status` (see analysis.py's
+    # handle_visual_phase_result), so this can be set even while `status` is
+    # still "analyzing", or stay unset once "ready" if that service hasn't
+    # replied yet. Covers only 4 of the 10 canonical phases — see that
+    # service's module docstring.
+    visual_phase_name: str | None = None
+    visual_phase_confidence: float | None = None
 
 
 ProjectFileOut.model_rebuild()
