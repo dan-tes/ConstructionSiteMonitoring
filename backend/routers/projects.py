@@ -8,7 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Respo
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 
-from analysis import schedule_analysis
+from analysis import schedule_entry_analysis
 from config import settings
 from deps import CurrentUser, DbSession
 from integrations import broker
@@ -303,7 +303,6 @@ async def add_entry(
     db.add(entry)
     await db.flush()
 
-    assets: list[MediaAsset] = []
     for f, kind in zip(files, kinds):
         asset_id = uuid.uuid4()
         storage_path, size = await save_upload(f, project.id, asset_id)
@@ -320,12 +319,12 @@ async def add_entry(
             analysis_status="pending",
         )
         db.add(asset)
-        assets.append(asset)
 
     await db.commit()
 
-    for asset in assets:
-        schedule_analysis(background, asset.id)
+    # One combined analysis for the whole entry, not one per file — see
+    # analysis.py's run_entry_analysis.
+    schedule_entry_analysis(background, entry.id)
 
     entry = (
         await db.execute(
@@ -337,23 +336,23 @@ async def add_entry(
     return entry_to_out(entry)
 
 
-@router.get("/{project_id}/videos/{video_id}", response_model=ProjectFileOut)
-async def get_video(
-    project_id: uuid.UUID, video_id: uuid.UUID, db: DbSession, user: CurrentUser
-) -> ProjectFileOut:
+@router.get("/{project_id}/entries/{entry_id}", response_model=JournalEntryOut)
+async def get_entry(
+    project_id: uuid.UUID, entry_id: uuid.UUID, db: DbSession, user: CurrentUser
+) -> JournalEntryOut:
+    """Polled by the frontend while an entry's combined analysis is still
+    running — see analysis.py's run_entry_analysis/_maybe_advance_entry."""
     await _get_owned_project(db, user, project_id)
-    asset = (
+    entry = (
         await db.execute(
-            select(MediaAsset).where(
-                MediaAsset.id == video_id,
-                MediaAsset.project_id == project_id,
-                MediaAsset.role.in_(("journal_video", "journal_photo")),
-            )
+            select(JournalEntry)
+            .where(JournalEntry.id == entry_id, JournalEntry.project_id == project_id)
+            .options(selectinload(JournalEntry.media))
         )
     ).scalar_one_or_none()
-    if asset is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Файл не найден")
-    return asset_to_file_out(asset, with_insight=True)
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Запись не найдена")
+    return entry_to_out(entry)
 
 
 @router.delete("/{project_id}/entries/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)

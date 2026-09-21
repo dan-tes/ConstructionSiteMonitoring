@@ -24,8 +24,8 @@ interface ProjectsContextValue {
   setProjectPlan: (id: string, file: File | null) => Promise<void>
   downloadCanonicalPlan: (id: string) => Promise<Blob>
   addJournalEntry: (id: string, mediaFiles: File[], author: string, date: string) => Promise<void>
-  /** Re-fetch one video's analysis and merge it in. Returns the new status. */
-  refreshVideo: (projectId: string, videoId: string) => Promise<VideoInsight['status'] | undefined>
+  /** Re-fetch one journal entry's combined analysis and merge it in. Returns the new status. */
+  refreshEntry: (projectId: string, entryId: string) => Promise<VideoInsight['status'] | undefined>
 }
 
 const ProjectsContext = createContext<ProjectsContextValue | null>(null)
@@ -110,53 +110,50 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
 
   const downloadCanonicalPlan = useCallback((id: string) => projectsApi.downloadCanonicalPlan(id), [])
 
-  const patchVideo = useCallback((projectId: string, videoId: string, insight?: VideoInsight) => {
+  const patchEntry = useCallback((projectId: string, entryId: string, insight?: VideoInsight) => {
     setProjects((prev) =>
       prev.map((p) =>
         p.id === projectId
           ? {
               ...p,
-              entries: p.entries.map((e) => ({
-                ...e,
-                media: e.media.map((m) => (m.id === videoId ? { ...m, insight } : m)),
-              })),
+              entries: p.entries.map((e) => (e.id === entryId ? { ...e, insight } : e)),
             }
           : p,
       ),
     )
   }, [])
 
-  const refreshVideo = useCallback(
-    async (projectId: string, videoId: string) => {
-      const video = await projectsApi.getVideo(projectId, videoId)
-      patchVideo(projectId, videoId, video.insight)
-      // A finished video may have produced a fresh project-level summary.
-      if (!isPending(video.insight?.status)) {
+  const refreshEntry = useCallback(
+    async (projectId: string, entryId: string) => {
+      const entry = await projectsApi.getEntry(projectId, entryId)
+      patchEntry(projectId, entryId, entry.insight)
+      // A finished entry may have produced a fresh project-level summary.
+      if (!isPending(entry.insight?.status)) {
         projectsApi.get(projectId).then(upsert).catch(() => {})
       }
-      return video.insight?.status
+      return entry.insight?.status
     },
-    [patchVideo, upsert],
+    [patchEntry, upsert],
   )
 
   const pollUntilReady = useCallback(
-    (projectId: string, videoId: string) => {
+    (projectId: string, entryId: string) => {
       const timers = pollTimers.current
-      if (timers.has(videoId)) return
+      if (timers.has(entryId)) return
       const timer = setInterval(async () => {
         try {
-          const next = await refreshVideo(projectId, videoId)
+          const next = await refreshEntry(projectId, entryId)
           if (!isPending(next)) {
             clearInterval(timer)
-            timers.delete(videoId)
+            timers.delete(entryId)
           }
         } catch {
           // transient error — keep polling
         }
       }, ANALYSIS_POLL_MS)
-      timers.set(videoId, timer)
+      timers.set(entryId, timer)
     },
-    [refreshVideo],
+    [refreshEntry],
   )
 
   const addJournalEntry = useCallback(
@@ -165,9 +162,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
       setProjects((prev) =>
         prev.map((p) => (p.id === id ? { ...p, entries: [entry, ...p.entries] } : p)),
       )
-      for (const video of entry.media) {
-        if (isPending(video.insight?.status)) pollUntilReady(id, video.id)
-      }
+      if (isPending(entry.insight?.status)) pollUntilReady(id, entry.id)
     },
     [pollUntilReady],
   )
@@ -183,7 +178,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     setProjectPlan,
     downloadCanonicalPlan,
     addJournalEntry,
-    refreshVideo,
+    refreshEntry,
   }
 
   return <ProjectsContext.Provider value={value}>{children}</ProjectsContext.Provider>

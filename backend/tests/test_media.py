@@ -233,10 +233,14 @@ async def test_video_upload_runs_analysis_and_fills_plan_status(client, auth):
     media = entry.json()["media"]
     assert len(media) == 1
     video_id = media[0]["id"]
+    entry_id = entry.json()["id"]
 
     # conftest fakes the broker so the whole vision→phase→delay chain runs
     # in-process, synchronously — the background task has completed by now.
-    got = (await client.get(f"/projects/{pid}/videos/{video_id}", headers=headers)).json()
+    # Analysis is combined per entry now, not per file (see analysis.py's
+    # run_entry_analysis), so individual media no longer carry their own insight.
+    assert media[0]["insight"] is None
+    got = (await client.get(f"/projects/{pid}/entries/{entry_id}", headers=headers)).json()
     assert got["insight"]["status"] == "ready"
     assert got["insight"]["stageSummary"]
     assert got["insight"]["equipmentSummary"]
@@ -280,6 +284,38 @@ async def test_video_analysis_accumulates_daily_equipment_history(client, auth):
     assert observations[1][1] == {"excavator": 1}
 
 
+async def test_multi_file_entry_gets_one_combined_analysis(client, auth):
+    """Uploading several files in one entry should run vision on each file
+    but produce exactly ONE phase/delay result for the whole entry, not one
+    per file — see analysis.py's run_entry_analysis/_maybe_advance_entry."""
+    username, headers = await auth()
+    pid = await _project(client, headers)
+
+    entry = await client.post(
+        f"/projects/{pid}/entries",
+        headers=headers,
+        data={"author": username, "date": "2026-09-01"},
+        files=[("files", VIDEO), ("files", ("photo.jpg", b"\xff\xd8\xff", "image/jpeg"))],
+    )
+    assert entry.status_code == 201
+    body = entry.json()
+    entry_id = body["id"]
+    assert len(body["media"]) == 2
+    # No per-file insight any more — the combined result lives on the entry.
+    assert all(m["insight"] is None for m in body["media"])
+
+    got = (await client.get(f"/projects/{pid}/entries/{entry_id}", headers=headers)).json()
+    assert got["insight"]["status"] == "ready"
+    assert got["insight"]["stageSummary"]
+    assert got["insight"]["equipmentSummary"]
+
+    # Both files' counts merged into one row (max per class, not summed) —
+    # not one row per file.
+    observations = await _equipment_observations(pid)
+    assert [d.isoformat() for d, _ in observations] == ["2026-09-01"]
+    assert observations[0][1] == {"excavator": 1}
+
+
 async def test_photo_upload_runs_analysis_and_fills_plan_status(client, auth):
     username, headers = await auth()
     pid = await _project(client, headers)
@@ -294,11 +330,11 @@ async def test_photo_upload_runs_analysis_and_fills_plan_status(client, auth):
     media = entry.json()["media"]
     assert len(media) == 1
     assert media[0]["kind"] == "image"
-    photo_id = media[0]["id"]
+    entry_id = entry.json()["id"]
 
     # conftest fakes the broker so the whole vision→phase→delay chain runs
     # in-process, synchronously — the background task has completed by now.
-    got = (await client.get(f"/projects/{pid}/videos/{photo_id}", headers=headers)).json()
+    got = (await client.get(f"/projects/{pid}/entries/{entry_id}", headers=headers)).json()
     assert got["insight"]["status"] == "ready"
     assert got["insight"]["stageSummary"]
     assert got["insight"]["equipmentSummary"]
@@ -330,10 +366,10 @@ async def test_video_and_plan_scoped_to_owner(client, auth):
         data={"author": alice_name, "date": "2026-09-01"},
         files=[("files", VIDEO)],
     )
-    video_id = entry.json()["media"][0]["id"]
+    entry_id = entry.json()["id"]
 
     assert (
-        await client.get(f"/projects/{pid}/videos/{video_id}", headers=bob)
+        await client.get(f"/projects/{pid}/entries/{entry_id}", headers=bob)
     ).status_code == 404
     assert (
         await client.post(

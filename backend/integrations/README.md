@@ -63,11 +63,12 @@ never needs to know which one a given project's plan took:
 
 **visual_phase** (`visual_phase.command`/`visual_phase.result`) stands apart
 from the vision→phase→delay chain the same way plan's fast/LLM paths stand
-apart from each other: `run_analysis()` fires `visual_phase.command` at the
-same time as `vision.command` (see `analysis.py`), and its result is just
-persisted (`MediaAsset.visual_phase_name`/`visual_phase_confidence`) by
-`handle_visual_phase_result` — it never blocks, gates or feeds `phase`'s or
-`delay`'s commands. That's deliberate, not a missing wire-up: the model
+apart from each other: `run_entry_analysis()` fires one `visual_phase.command`
+per journal entry, against one representative file (see `analysis.py`), and
+its result is just persisted (`JournalEntry.visual_phase_name`/
+`visual_phase_confidence`) by `handle_visual_phase_result` — it never
+blocks, gates or feeds `phase`'s or `delay`'s commands. That's deliberate,
+not a missing wire-up: the model
 behind it (`services/visual_phase/model.py` — a DINOv2 backbone
 self-supervised fine-tuned on ~10k unlabeled site photos, see
 `phase_determination/visual_state_pretraining.ipynb`) has no labeled
@@ -124,22 +125,35 @@ primitive, so every step — slow or fast — looks the same on the wire.
    backend  ◀──delay.result──   backend.delay.result.q   ◀── delay service
 ```
 
-`plan.command`/`plan.result` stand apart from the other three: they're not
-part of `run_analysis()`'s per-video choreography, but a one-off triggered
-from `upload_plan` (routers/projects.py) whenever the fast path
+`plan.command`/`plan.result` stand apart from the other four: they're not
+part of `run_entry_analysis()`'s per-entry choreography, but a one-off
+triggered from `upload_plan` (routers/projects.py) whenever the fast path
 (`plan_parser.py`) can't parse what was uploaded. `handle_plan_result` in
 `analysis.py` persists the outcome to `PlanStage` the same way the fast path
 does, and that's the end of it — no further command follows.
 
-`run_analysis()` itself becomes a choreography driven by result messages
-rather than a straight-line `await` chain: publish `vision.command` (and,
-alongside it, `visual_phase.command` — see above) → on `vision.result`
-persist equipment counts and publish `phase.command` → on `phase.result`
-persist the phase and publish `delay.command` → on `delay.result` persist
-the forecast and move on to GPT summaries (blocks 5/6, TBD).
-`visual_phase.result` is consumed independently and just persists its two
-fields, on its own schedule, whenever it arrives. Each stage transition
-happens in the backend's result consumer, keyed by `correlation_id`.
+A journal entry (`JournalEntry` — the photos/videos one site-visit upload
+produced, together) is where the choreography starts, and it runs once for
+the WHOLE entry, not once per file: vision is the one exception, since
+equipment detection is genuinely per-file work. `run_entry_analysis()`
+publishes one `vision.command` per file in the entry (plus the entry's one
+`visual_phase.command`, see above) → each file's own `vision.result`
+persists that file's equipment counts and marks that file's own status; once
+every file in the entry has reported in, `_maybe_advance_entry()` publishes
+the entry's ONE `phase.command` off the combined counts → on `phase.result`
+persist the phase and publish the entry's ONE `delay.command` → on
+`delay.result` persist the forecast, mark the entry `ready`, and move on to
+GPT summaries (blocks 5/6, TBD). `visual_phase.result` is consumed
+independently and just persists its two fields, on its own schedule,
+whenever it arrives. Each stage transition happens in the backend's result
+consumer, keyed by `correlation_id` — the entry's id for
+visual_phase/phase/delay, but the individual file's id for vision (see the
+`correlation_id` design-decision bullet below).
+
+This replaced an earlier design where phase/delay (and the original,
+per-file visual_phase) ran once per individual photo/video: three photos
+uploaded together used to fire three separate, slightly-redundant phase
+calls instead of the one phase the site visit actually represents.
 
 ### Topology
 
@@ -156,14 +170,16 @@ happens in the backend's result consumer, keyed by `correlation_id`.
 - All queues durable, messages published persistent, publisher confirms on.
 - Backend and service consumers ack only after their own write (DB commit /
   result publish) succeeds — at-least-once delivery, so every consumer
-  handler must be idempotent on `correlation_id` (e.g. skip if that asset's
+  handler must be idempotent on `correlation_id` (e.g. skip if that entry's
   phase is already recorded for this run).
 
 ### Message envelope
 
-Every message is `Envelope[T]` (see `schemas.py`): `correlation_id` (the
-`MediaAsset.id` this run belongs to), `published_at`, and `payload`. The
-payload is one of the `*Command`/`*Result` models. A `*Result.status` of
+Every message is `Envelope[T]` (see `schemas.py`): `correlation_id` (a
+`MediaAsset.id` for `plan`/`vision`, a `JournalEntry.id` for
+`visual_phase`/`phase`/`delay` — see the `correlation_id` design-decision
+bullet below), `published_at`, and `payload`. The payload is one of the
+`*Command`/`*Result` models. A `*Result.status` of
 `"failed"` (with `error` set) is how a service reports its own failure back
 through the same channel — the backend's result consumer treats that the
 same way `analysis_status = "failed"` works today, no separate error path.
@@ -221,11 +237,17 @@ same way `analysis_status = "failed"` works today, no separate error path.
   `services/phase/worker.py`'s docstring.
 - **Backend owns persistence.** Services are stateless message handlers; the
   equipment counts and the phase/delay results are stored on
-  `MediaAsset`/`Project`/`EquipmentObservation` by the backend (see
-  `models.py`), not by the services themselves.
-- **`correlation_id` is the `MediaAsset.id`.** One analysis run == one
-  uploaded journal video, so the asset's own id is a sufficient join key
-  across all three result queues; no separate run-id table needed.
+  `MediaAsset`/`JournalEntry`/`Project`/`EquipmentObservation` by the
+  backend (see `models.py`), not by the services themselves.
+- **`correlation_id` is the file's id for vision, the entry's id for
+  everything else.** Equipment detection is genuinely per-file work, so
+  `vision.command`/`vision.result` are keyed by `MediaAsset.id` — the join
+  key `handle_vision_result` uses to persist that file's own status and
+  counts, and to know (via `_maybe_advance_entry`) when every file in an
+  entry has reported in. `visual_phase`/`phase`/`delay` are keyed by
+  `JournalEntry.id` instead, since their result is one combined answer for
+  the whole entry, not one per file — no separate run-id table needed for
+  either.
 - **visual_phase over the same broker, same envelope shape, fired in
   parallel rather than chained.** Still one connection style for every
   service (`consistent-service-integration-pattern` — queue everywhere,
@@ -317,11 +339,11 @@ same way `analysis_status = "failed"` works today, no separate error path.
   `weights/classifier.json` (the cluster centroids + phase labels, small) is
   committed normally.
 - **visual_phase**: no history kept — each new result overwrites
-  `MediaAsset.visual_phase_name`/`visual_phase_confidence` for that asset,
+  `JournalEntry.visual_phase_name`/`visual_phase_confidence` for that entry,
   there's no per-project trend the way `EquipmentObservation` gives the
-  equipment-based phase model. Not needed for a single-photo signal today,
-  but worth knowing before building anything that expects a time series out
-  of it.
+  equipment-based phase model. Not needed for a one-photo-per-entry signal
+  today, but worth knowing before building anything that expects a time
+  series out of it.
 - **delay**: `current_phase_started_at` is simplified to `planned_start +`
   the matched phase's offset (assumes the phase started on time) — there's
   no history of when the phase detector *itself* first reported the current
@@ -356,13 +378,14 @@ same way `analysis_status = "failed"` works today, no separate error path.
 - Blocks 5/6: GPT contracts for the per-video report and the project-level
   status summary — likely in-process calls (already outside the broker
   pipeline, since nothing calls them as a service), but not yet specced.
-- No new columns/migration added: `handle_phase_result`/`handle_delay_result`
-  currently render `PhaseResult`/`DelayForecastResult` straight into the
-  existing `stage_summary` text column instead of storing `current_phase`,
-  `delay_days`, etc. as structured fields. Fine while the frontend only ever
-  displays that text, but if a screen needs the phase name or delay-days
-  number on their own later, that's an Alembic migration (`PlanStage` table,
-  `MediaAsset.equipment` too, for the same reason on the vision side).
+- No structured phase/delay columns: `handle_phase_result`/`handle_delay_result`
+  still render `PhaseResult`/`DelayForecastResult` straight into
+  `JournalEntry.stage_summary`, one text blob, instead of storing
+  `current_phase`, `delay_days`, etc. as their own fields (unlike
+  `visual_phase_name`/`visual_phase_confidence`, which did get real
+  columns). Fine while the frontend only ever displays that text, but if a
+  screen needs the phase name or delay-days number on their own later,
+  that's another Alembic migration.
 - Dead-letter handling: a poison message (a handler that keeps failing) has
   no defined destination yet — likely a per-queue DLX once implementation
   starts, not designed in detail here.

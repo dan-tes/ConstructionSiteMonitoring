@@ -3,12 +3,12 @@ import { useEffect, useState } from 'react'
 import { Link, Navigate, useParams } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { useProjects } from '../context/ProjectsContext'
-import { formatFileSize } from '../lib/files'
+import { MediaGrid } from '../components/MediaGrid'
 
-export function VideoDetailPage() {
-  const { id, videoId } = useParams<{ id: string; videoId: string }>()
+export function EntryDetailPage() {
+  const { id, entryId } = useParams<{ id: string; entryId: string }>()
   const { user } = useAuth()
-  const { getProject, refreshProject, refreshVideo } = useProjects()
+  const { getProject, refreshProject, refreshEntry } = useProjects()
   const project = id ? getProject(id) : undefined
   const [notFound, setNotFound] = useState(false)
 
@@ -17,24 +17,22 @@ export function VideoDetailPage() {
     refreshProject(id).catch(() => setNotFound(true))
   }, [id, refreshProject])
 
-  const entry = project?.entries.find((e) => e.media.some((m) => m.id === videoId))
-  const video = entry?.media.find((m) => m.id === videoId)
-  const isImage = video?.kind === 'image'
-  const insight = video?.insight
+  const entry = project?.entries.find((e) => e.id === entryId)
+  const insight = entry?.insight
   const status = insight?.status
   const isReady = status === 'ready'
   const isFailed = status === 'failed'
-  const photos = insight?.photos ?? []
 
-  // Poll the analysis while it's running (the video exists but isn't done yet).
+  // Poll the combined analysis while it's running (the entry exists but
+  // isn't done yet — see backend's analysis.py run_entry_analysis).
   useEffect(() => {
-    if (!id || !videoId || !video) return
+    if (!id || !entryId || !entry) return
     if (status === 'ready' || status === 'failed') return
     const timer = setInterval(() => {
-      void refreshVideo(id, videoId).catch(() => {})
+      void refreshEntry(id, entryId).catch(() => {})
     }, 4000)
     return () => clearInterval(timer)
-  }, [id, videoId, video, status, refreshVideo])
+  }, [id, entryId, entry, status, refreshEntry])
 
   if (notFound) {
     return <Navigate to="/projects" replace />
@@ -73,41 +71,31 @@ export function VideoDetailPage() {
           {project.name}
         </Link>
 
-        {!video ? (
+        {!entry ? (
           <p className="mt-8 rounded-xl border border-dashed border-site-700 bg-site-900/30 px-4 py-10 text-center text-sm text-site-500">
-            Файл не найден — возможно, он был удалён.
+            Запись не найдена — возможно, она была удалена.
           </p>
         ) : (
           <>
             <h1 className="mt-4 font-display text-2xl font-bold text-site-100 sm:text-3xl">
-              {video.name}
+              Запись от {new Date(entry.date).toLocaleDateString('ru-RU')}
             </h1>
-            <p className="mt-1 text-sm text-site-500">{formatFileSize(video.size)}</p>
+            <p className="mt-1 text-sm text-site-500">
+              {entry.author}
+              {entry.comment ? ` — ${entry.comment}` : ''}
+            </p>
 
             <div className="hazard-stripes mt-6 h-1 w-full rounded-full opacity-70" />
 
-            {isImage ? (
-              <img
-                src={video.url}
-                alt={video.name}
-                className="mt-6 w-full rounded-xl border border-site-700 bg-black object-contain"
-              />
-            ) : (
-              <video
-                src={video.url}
-                controls
-                className="mt-6 w-full rounded-xl border border-site-700 bg-black"
-              />
-            )}
+            <MediaGrid files={entry.media} />
 
             {isFailed ? (
               <div className="mt-8 rounded-2xl border border-red-900/60 bg-red-950/30 p-5">
                 <h2 className="font-display text-lg font-semibold text-site-100">
-                  Не удалось проанализировать {isImage ? 'фото' : 'видео'}
+                  Не удалось проанализировать запись
                 </h2>
                 <p className="mt-2 text-sm leading-relaxed text-site-400">
-                  Нейросеть не смогла обработать этот файл. Попробуйте загрузить{' '}
-                  {isImage ? 'фото' : 'видео'} ещё раз.
+                  Нейросеть не смогла обработать эти файлы. Попробуйте загрузить их ещё раз.
                 </p>
               </div>
             ) : !isReady ? (
@@ -115,12 +103,12 @@ export function VideoDetailPage() {
                 <Loader2 className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-safety-400" />
                 <div>
                   <h2 className="font-display text-lg font-semibold text-site-100">
-                    {isImage ? 'Фото анализируется' : 'Видео анализируется'}
+                    Запись анализируется
                   </h2>
                   <p className="mt-2 text-sm leading-relaxed text-site-400">
-                    Нейросеть обрабатывает этот файл. Пока анализ не завершён, сказать что-либо об
-                    этапе строительства, технике в кадре или зафиксированных событиях невозможно —
-                    результаты появятся на этой странице автоматически.
+                    Нейросеть обрабатывает загруженные файлы. Пока анализ не завершён, сказать
+                    что-либо об этапе строительства или технике в кадре невозможно — результаты
+                    появятся на этой странице автоматически.
                   </p>
                 </div>
               </div>
@@ -177,36 +165,8 @@ export function VideoDetailPage() {
                   </section>
                 )}
 
-                {photos.length > 0 && (
-                  <section className="mt-4 rounded-2xl border border-site-700 bg-site-900/50 p-5">
-                    <h2 className="font-display text-lg font-semibold text-site-100">
-                      Кадры из видео
-                    </h2>
-                    <p className="mt-1 text-sm text-site-400">
-                      Техника и важные зафиксированные события
-                    </p>
-                    <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
-                      {photos.map((photo) => (
-                        <a
-                          key={photo.id}
-                          href={photo.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="aspect-square overflow-hidden rounded-lg border border-site-700 bg-site-800"
-                        >
-                          <img
-                            src={photo.url}
-                            alt={photo.name}
-                            className="h-full w-full object-cover"
-                          />
-                        </a>
-                      ))}
-                    </div>
-                  </section>
-                )}
-
                 <p className="mt-4 text-xs text-site-500">
-                  Оценка сформирована нейросетью по этому {isImage ? 'фото' : 'видео'}
+                  Оценка сформирована нейросетью по всем файлам этой записи
                 </p>
               </>
             )}

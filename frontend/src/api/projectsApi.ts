@@ -49,7 +49,7 @@ export const projectsApi = {
     return request<JournalEntry>(`/projects/${id}/entries`, { method: 'POST', body: form })
   },
 
-  getVideo(id: string, videoId: string): Promise<ProjectFile> {
-    return request<ProjectFile>(`/projects/${id}/videos/${videoId}`)
+  getEntry(id: string, entryId: string): Promise<JournalEntry> {
+    return request<JournalEntry>(`/projects/${id}/entries/${entryId}`)
   },
 }

@@ -107,6 +107,24 @@ class JournalEntry(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # Combined analysis for every file uploaded as part of this entry — one
+    # result per upload batch, not one per file. See analysis.py's
+    # run_entry_analysis/_maybe_advance_entry: vision (equipment detection)
+    # still runs per file, but phase/delay/visual_phase run once the whole
+    # entry's files have all reported in.
+    analysis_status: Mapped[str] = mapped_column(
+        String(12), default="pending", server_default="pending", nullable=False
+    )  # pending | analyzing | ready | failed
+    stage_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    equipment_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Visual-phase signal (services/visual_phase), computed once per entry
+    # against one representative file — observational only, does not feed
+    # the delay forecast; see analysis.py's handle_visual_phase_result.
+    visual_phase_name: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    visual_phase_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     project: Mapped[Project] = relationship(back_populates="entries")
     media: Mapped[list["MediaAsset"]] = relationship(
         back_populates="entry",
@@ -140,18 +158,15 @@ class MediaAsset(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    # Video/photo analysis (role in 'journal_video'/'journal_photo'). See analysis.py.
+    # This file's OWN status: for role='plan', the plan-normalization step
+    # (see analysis.py's handle_plan_result); for role in
+    # 'journal_video'/'journal_photo', just whether ITS OWN vision (equipment
+    # detection) step has finished — the combined phase/delay/visual_phase
+    # result for the whole entry this file belongs to lives on
+    # JournalEntry, not here (see analysis.py's run_entry_analysis).
     analysis_status: Mapped[str] = mapped_column(
         String(12), default="pending", server_default="pending", nullable=False
     )  # pending | analyzing | ready | failed
-    stage_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    equipment_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-    # Visual-phase signal (services/visual_phase) — observational only, does
-    # not feed the delay forecast; see analysis.py's handle_visual_phase_result.
-    visual_phase_name: Mapped[str | None] = mapped_column(String(30), nullable=True)
-    visual_phase_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     project: Mapped[Project] = relationship(back_populates="assets")
     entry: Mapped["JournalEntry | None"] = relationship(back_populates="media")

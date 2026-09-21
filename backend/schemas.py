@@ -62,18 +62,25 @@ class ProjectFileOut(CamelModel):
     size: int
     url: str
     kind: str
+    # Only ever set for the project plan asset (its own normalization
+    # status) — a journal video/photo has no insight of its own any more,
+    # see JournalEntryOut.insight: analysis is combined per upload batch
+    # (entry), not per individual file.
     insight: VideoInsightOut | None = None
 
 
 class VideoInsightOut(CamelModel):
-    """Backend neural-network analysis of an uploaded journal video."""
+    """Backend neural-network analysis: either a plan's own normalization
+    status, or (via JournalEntryOut.insight) a journal entry's combined
+    result across every file uploaded in that batch."""
 
     status: str  # pending | analyzing | ready | failed
     stage_summary: str | None = None
     equipment_summary: str | None = None
     photos: list[ProjectFileOut] = []
-    # Experimental, observational-only signal from services/visual_phase —
-    # arrives independently of `status` (see analysis.py's
+    # Experimental, observational-only signal from services/visual_phase,
+    # computed once per entry against one representative file — arrives
+    # independently of `status` (see analysis.py's
     # handle_visual_phase_result), so this can be set even while `status` is
     # still "analyzing", or stay unset once "ready" if that service hasn't
     # replied yet. Covers only 4 of the 10 canonical phases — see that
@@ -91,6 +98,9 @@ class JournalEntryOut(CamelModel):
     author: str
     date: date_type
     media: list[ProjectFileOut] = []
+    # Combined analysis for every file in `media` together — see
+    # analysis.py's run_entry_analysis/_maybe_advance_entry.
+    insight: VideoInsightOut | None = None
 
 
 class ProjectOut(CamelModel):

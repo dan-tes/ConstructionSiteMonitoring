@@ -39,7 +39,7 @@ export function ProjectDetailPage() {
 
   // Most uploaded plans aren't already in our canonical shape, so upload_plan
   // hands them to an LLM to re-map onto our 10 canonical phases — poll while
-  // that's in flight (mirrors VideoDetailPage's analysis polling).
+  // that's in flight (mirrors EntryDetailPage's analysis polling).
   useEffect(() => {
     if (!id || !planInsightStatus) return
     if (planInsightStatus === 'ready' || planInsightStatus === 'failed') return
