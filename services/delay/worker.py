@@ -180,7 +180,11 @@ def compute(command: DelayForecastCommand) -> DelayForecastResult:  # EXTENSION 
     # phase started exactly on schedule (no history of when it actually
     # started; see backend/integrations/README.md Open items).
     activity_duration_sum = sum(s.planned_duration_days for s in stages)
-    planned_duration_days = command.project_duration_days or activity_duration_sum
+    planned_duration_days = (
+        command.project_duration_days
+        if command.project_duration_days is not None
+        else activity_duration_sum
+    )
     scale = planned_duration_days / activity_duration_sum if activity_duration_sum else 1.0
 
     phase_start_offset_days = (
@@ -188,7 +192,12 @@ def compute(command: DelayForecastCommand) -> DelayForecastResult:  # EXTENSION 
         * scale
     )
     phase_planned_duration_days = matched.planned_duration_days * scale
-    current_phase_started_at = command.planned_start + timedelta(days=phase_start_offset_days)
+    # date + timedelta only honors timedelta.days, so a fractional offset
+    # must be rounded first or it's silently floored (dropping up to
+    # ~1 day) rather than rounded.
+    current_phase_started_at = command.planned_start + timedelta(
+        days=round(phase_start_offset_days)
+    )
     log.info(
         "found phase %r at offset %.1f/%.0f days (scale %.2fx from activity-duration sum), "
         "assumed started %s, status date %s",
