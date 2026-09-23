@@ -1,4 +1,4 @@
-import type { JournalEntry, Project, ProjectFile } from '../types/project'
+import type { JournalEntry, Project, ProjectFile, ProjectTimeline } from '../types/project'
 import { request, requestBlob } from './client'
 
 export const projectsApi = {
@@ -29,11 +29,23 @@ export const projectsApi = {
   },
 
   /** The project's plan re-expressed in our canonical .xlsx format (see
-   * backend/plan_parser.py) — available once it's been parsed/normalized,
+   * backend/plan_parser.py) plus the current fact from the journal (phase
+   * statuses, `actuals`/`history` sheets — backend/progress.py). Built fresh
+   * on every download; available once the plan has been parsed/normalized,
    * regardless of whether the original upload already was canonical or
    * needed the LLM fallback. */
   downloadCanonicalPlan(id: string): Promise<Blob> {
     return requestBlob(`/projects/${id}/plan/canonical`)
+  },
+
+  /** Series for the project page's delay charts (backend's GET /projects/{id}/timeline). */
+  timeline(id: string): Promise<ProjectTimeline> {
+    return request<ProjectTimeline>(`/projects/${id}/timeline`)
+  },
+
+  /** Freeze the project: stores the final plan-vs-actual report and blocks further changes. */
+  close(id: string): Promise<Project> {
+    return request<Project>(`/projects/${id}/close`, { method: 'POST' })
   },
 
   uploadVideos(

@@ -277,3 +277,14 @@ class TestCompute:
         compute(self._command(project_duration_days=15.0))
 
         assert captured["current_phase_started_at"] == PLANNED_START + timedelta(days=9)
+
+    def test_observed_phase_start_replaces_on_plan_assumption(self):
+        # framing is planned for days 10–17; as of day 12 it has only been
+        # running since day 11 (a day late). Assuming it started on plan
+        # (day 10) would read as exactly on schedule — the "sawtooth" reset
+        # that zeroed the forecast on every phase change.
+        on_plan = compute(self._command())
+        observed = compute(self._command(current_phase_started_at=PLANNED_START + timedelta(days=11)))
+        assert on_plan.delay_days == 0
+        # ES = 10 + 1 = 11 of 12 elapsed days -> SPI 11/12 -> 17 / (11/12) - 17 = 1.55
+        assert observed.delay_days == 2

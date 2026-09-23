@@ -86,7 +86,11 @@ async def _fake_publish(routing_key: str, body: bytes) -> None:
         )
     elif routing_key == broker.DELAY_COMMAND:
         result = DelayForecastResult(
-            status="done", delay_days=2, expected_completion=date.today(), confidence=0.8
+            status="done",
+            delay_days=2,
+            expected_completion=date.today(),
+            confidence=0.8,
+            spi_time=0.95,
         )
         await analysis.handle_delay_result(
             Envelope(

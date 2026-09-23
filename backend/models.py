@@ -61,6 +61,10 @@ class Project(Base):
     # normalized plan — see plan_parser.py / PlanStage / integrations/schemas.py's
     # PlanNormalizeResult). None until a plan has been parsed/normalized.
     plan_duration_days: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Set once by POST /projects/{id}/close, which also freezes the
+    # plan-vs-actual export as a `final_report` asset (see progress.py). A
+    # closed project accepts no new journal entries or plan changes.
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -88,6 +92,10 @@ class Project(Base):
     @property
     def plan_asset(self) -> "MediaAsset | None":
         return next((a for a in self.assets if a.role == "plan"), None)
+
+    @property
+    def final_report_asset(self) -> "MediaAsset | None":
+        return next((a for a in self.assets if a.role == "final_report"), None)
 
 
 class JournalEntry(Base):
@@ -125,6 +133,27 @@ class JournalEntry(Base):
     visual_phase_name: Mapped[str | None] = mapped_column(String(30), nullable=True)
     visual_phase_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # The same phase/delay numbers `stage_summary` already renders into one
+    # text blob, kept as their own columns too — see report.py/analysis.py's
+    # _build_entry_facts: blocks 5/6 (GPT narrative reports) need these as
+    # structured facts to ground a report in, not re-parsed out of prose.
+    phase_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    phase_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    delay_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_completion: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Effective SPI(t) behind delay_days — see DelayForecastResult.spi_time.
+    spi_time: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Block 5 (диаграмма: блок 5) — a short GPT narrative for this entry,
+    # grounded in the structured facts above plus each file's own equipment
+    # findings (MediaAsset.equipment_counts), with markdown links back to the
+    # specific photo/video that supports a given claim (e.g. "no equipment
+    # visible in this photo, hence the delay") — see report.py. Best-effort:
+    # None if no YANDEX_CLOUD_* key is configured, or if the call fails; a
+    # missing narrative never fails the entry itself, only stage_summary is
+    # load-bearing for the pipeline.
+    narrative_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     project: Mapped[Project] = relationship(back_populates="entries")
     media: Mapped[list["MediaAsset"]] = relationship(
         back_populates="entry",
@@ -148,7 +177,7 @@ class MediaAsset(Base):
     source_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(), ForeignKey("media_assets.id", ondelete="CASCADE"), nullable=True
     )
-    role: Mapped[str] = mapped_column(String(20), nullable=False)  # plan | journal_video | journal_photo | frame
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # plan | journal_video | journal_photo | frame | final_report
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(128), nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -167,6 +196,16 @@ class MediaAsset(Base):
     analysis_status: Mapped[str] = mapped_column(
         String(12), default="pending", server_default="pending", nullable=False
     )  # pending | analyzing | ready | failed
+
+    # This file's OWN equipment counts (JSON-encoded {equipment_class:
+    # count}), set for journal_video/journal_photo roles once vision.result
+    # comes back — see analysis.py's handle_vision_result. Kept alongside
+    # (not instead of) the project's day-merged EquipmentObservation: that
+    # table answers "how much of class X did the project have on date D"
+    # (max across same-day files, per-file granularity lost), while this
+    # column is what lets the block-5 narrative report cite a *specific*
+    # photo/video's own findings (see report.py's FileEvidence).
+    equipment_counts: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     project: Mapped[Project] = relationship(back_populates="assets")
     entry: Mapped["JournalEntry | None"] = relationship(back_populates="media")

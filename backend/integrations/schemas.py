@@ -231,6 +231,11 @@ class DelayForecastCommand(BaseModel):
     current_phase: str
     as_of_date: date
     phase_confidence: float = 1.0  # module 3's confidence in current_phase, 0..1
+    # When current_phase actually started on site, estimated from the
+    # project's own phase history (see progress.py's estimate_phase_start).
+    # None when that history has no earlier phase to measure from — the
+    # delay service then falls back to the phase's planned start.
+    current_phase_started_at: date | None = None
 
 
 class DelayForecastResult(BaseModel):
@@ -238,4 +243,8 @@ class DelayForecastResult(BaseModel):
     delay_days: int | None = None  # positive = behind schedule, negative = ahead
     expected_completion: date | None = None
     confidence: float | None = None
+    # Effective SPI(t) behind delay_days (confidence-shrunk, see the delay
+    # worker): 1.0 = on schedule, 0.9 = nine plan-days earned per ten
+    # calendar days. Feeds the pace chart (graph D).
+    spi_time: float | None = None
     error: str | None = None

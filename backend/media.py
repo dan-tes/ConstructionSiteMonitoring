@@ -132,6 +132,7 @@ def entry_to_out(entry: JournalEntry) -> JournalEntryOut:
         status=entry.analysis_status,
         stage_summary=entry.stage_summary if ready else None,
         equipment_summary=entry.equipment_summary if ready else None,
+        narrative_report=entry.narrative_report if ready else None,
         photos=[],  # frame extraction not implemented yet
         visual_phase_name=entry.visual_phase_name,
         visual_phase_confidence=entry.visual_phase_confidence,
@@ -156,4 +157,6 @@ def project_to_out(project: Project) -> ProjectOut:
         plan_status=project.plan_status,
         entries=[entry_to_out(e) for e in project.entries],
         created_at=project.created_at,
+        closed_at=project.closed_at,
+        final_report=asset_to_file_out(final) if (final := project.final_report_asset) else None,
     )

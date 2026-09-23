@@ -175,12 +175,15 @@ async def test_canonical_plan_download_round_trips(client, auth):
     assert stages == {"Earthwork": 30}
 
 
-async def test_canonical_plan_download_404s_before_plan_ready(client, auth):
+async def test_canonical_plan_download_is_empty_before_plan_ready(client, auth):
     _, headers = await auth()
     pid = await _project(client, headers)
-    assert (
-        await client.get(f"/projects/{pid}/plan/canonical", headers=headers)
-    ).status_code == 404
+    download = await client.get(f"/projects/{pid}/plan/canonical", headers=headers)
+    assert download.status_code == 200
+    workbook = openpyxl.load_workbook(io.BytesIO(download.content), read_only=True)
+    # Headers only — nothing planned or observed yet.
+    for name in ("activities", "actuals", "history"):
+        assert len(list(workbook[name].iter_rows(values_only=True))) == 1
 
 
 async def test_plan_normalization_failure_marks_plan_failed(client, auth):
@@ -248,9 +251,43 @@ async def test_video_upload_runs_analysis_and_fills_plan_status(client, auth):
 
     project = (await client.get(f"/projects/{pid}", headers=headers)).json()
     assert project["planStatus"] == got["insight"]["stageSummary"]
+    # No YANDEX_CLOUD_* key in the test environment — report.py's blocks 5/6
+    # are disabled (see its module docstring), so narrativeReport stays
+    # unset rather than blocking the rest of the pipeline.
+    assert got["insight"].get("narrativeReport") is None
 
     served = await client.get(f"/files/{video_id}")
     assert served.status_code == 200
+
+
+async def test_narrative_reports_flow_to_entry_and_project_status(client, auth, monkeypatch):
+    """With blocks 5/6 (report.py) "enabled" (mocked, since there's no real
+    YANDEX_CLOUD_* key in tests — see report.py's module docstring), the
+    entry's own narrative (block 5) should end up on its insight, and the
+    project-level one (block 6) should end up on plan_status instead of the
+    plain stage_summary fallback _refresh_plan_status uses when narrative
+    generation is unavailable."""
+    import report
+
+    monkeypatch.setattr(report, "generate_entry_report", lambda facts: "Запись: техники не видно.")
+    monkeypatch.setattr(report, "generate_project_report", lambda facts: "Объект: отставание объяснимо.")
+
+    username, headers = await auth()
+    pid = await _project(client, headers)
+
+    entry = await client.post(
+        f"/projects/{pid}/entries",
+        headers=headers,
+        data={"author": username, "date": "2026-09-01"},
+        files=[("files", VIDEO)],
+    )
+    entry_id = entry.json()["id"]
+
+    got = (await client.get(f"/projects/{pid}/entries/{entry_id}", headers=headers)).json()
+    assert got["insight"]["narrativeReport"] == "Запись: техники не видно."
+
+    project = (await client.get(f"/projects/{pid}", headers=headers)).json()
+    assert project["planStatus"] == "Объект: отставание объяснимо."
 
 
 async def test_video_analysis_accumulates_daily_equipment_history(client, auth):

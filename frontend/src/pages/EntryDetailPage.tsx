@@ -1,9 +1,15 @@
-import { ArrowLeft, Cpu, Eye, HardHat, Loader2, Truck } from 'lucide-react'
+import { ArrowLeft, Cpu, Eye, HardHat, Loader2, Sparkles, Truck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useParams } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { useProjects } from '../context/ProjectsContext'
+import { LinkifiedText } from '../components/LinkifiedText'
 import { MediaGrid } from '../components/MediaGrid'
+
+// How long to keep polling a "ready" entry that has no narrativeReport yet
+// — see ProjectsContext.tsx's own copy of this constant for why (block 5's
+// LLM call can still be in flight a few seconds after "ready").
+const NARRATIVE_GRACE_MS = 20000
 
 export function EntryDetailPage() {
   const { id, entryId } = useParams<{ id: string; entryId: string }>()
@@ -23,16 +29,36 @@ export function EntryDetailPage() {
   const isReady = status === 'ready'
   const isFailed = status === 'failed'
 
+  // The entry's own narrativeReport (backend's report.py, block 5) is
+  // best-effort and generated *after* analysis_status already flips to
+  // "ready" (see analysis.py's handle_delay_result) — a real LLM call is
+  // still in flight for a few seconds at that point. Remember the moment
+  // we first saw "ready" so the poll below can keep checking for a short
+  // grace period instead of freezing the instant status flips, or a page
+  // opened in that narrow window would never pick the narrative up.
+  const [readySince, setReadySince] = useState<number | null>(null)
+  useEffect(() => {
+    setReadySince(status === 'ready' ? Date.now() : null)
+  }, [status])
+
+  const hasNarrative = Boolean(insight?.narrativeReport)
+
   // Poll the combined analysis while it's running (the entry exists but
-  // isn't done yet — see backend's analysis.py run_entry_analysis).
+  // isn't done yet — see backend's analysis.py run_entry_analysis), plus a
+  // short grace period after "ready" for the narrative above.
   useEffect(() => {
     if (!id || !entryId || !entry) return
-    if (status === 'ready' || status === 'failed') return
+    if (isFailed) return
+    if (isReady) {
+      const awaitingNarrative =
+        !hasNarrative && readySince !== null && Date.now() - readySince <= NARRATIVE_GRACE_MS
+      if (!awaitingNarrative) return
+    }
     const timer = setInterval(() => {
       void refreshEntry(id, entryId).catch(() => {})
     }, 4000)
     return () => clearInterval(timer)
-  }, [id, entryId, entry, status, refreshEntry])
+  }, [id, entryId, entry, isReady, isFailed, hasNarrative, readySince, refreshEntry])
 
   if (notFound) {
     return <Navigate to="/projects" replace />
@@ -114,7 +140,29 @@ export function EntryDetailPage() {
               </div>
             ) : (
               <>
-                <section className="mt-8 rounded-2xl border border-site-700 bg-site-900/50 p-5">
+                {insight?.narrativeReport && (
+                  <section className="mt-8 rounded-2xl border border-safety-600/40 bg-site-900/50 p-5">
+                    <div className="flex items-center gap-2.5">
+                      <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-site-800 text-safety-400">
+                        <Sparkles className="h-4.5 w-4.5" strokeWidth={1.75} />
+                      </span>
+                      <h2 className="font-display text-lg font-semibold text-site-100">
+                        Оценка ИИ
+                      </h2>
+                    </div>
+                    <LinkifiedText
+                      text={insight.narrativeReport}
+                      className="mt-3 text-sm leading-relaxed text-site-300"
+                    />
+                    <p className="mt-2 text-xs text-site-500">
+                      Ссылки в тексте ведут на конкретные фото и видео, на которых основан вывод
+                    </p>
+                  </section>
+                )}
+
+                <section
+                  className={`${insight?.narrativeReport ? 'mt-4' : 'mt-8'} rounded-2xl border border-site-700 bg-site-900/50 p-5`}
+                >
                   <div className="flex items-center gap-2.5">
                     <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-site-800 text-safety-400">
                       <Cpu className="h-4.5 w-4.5" strokeWidth={1.75} />

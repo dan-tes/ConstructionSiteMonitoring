@@ -14,6 +14,7 @@ dependencies = [
     "python-multipart>=0.0.12",
     "aio-pika>=10.0.1",
     "openpyxl>=3.1.5",
+    "openai>=1.50",
 ]
 
 [dependency-groups]

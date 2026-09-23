@@ -85,7 +85,9 @@ replacement for it — see `services/visual_phase/worker.py`'s docstring for
 the full reasoning and *Open items* below for what it would take to close
 the coverage gap.
 
-Blocks 5/6 (GPT summaries) aren't started — see *Open items* below.
+Blocks 5/6 (GPT narrative reports) are implemented — see `backend/report.py`
+and *Design decisions* below for why they're in-process rather than a sixth
+broker leg.
 
 ## Integration pattern
 
@@ -258,6 +260,24 @@ same way `analysis_status = "failed"` works today, no separate error path.
   If its classifier ever gets real coverage of all 10 phases, promoting it
   into (or blending it with) the equipment-based `phase` step is the
   natural next move; today it's deliberately a sidecar, not a dependency.
+- **Blocks 5/6 (`backend/report.py`) are an in-process call, not a sixth
+  broker leg.** Nothing outside `analysis.py` ever invokes them, so there's
+  no second service to keep consistent with the broker pattern (see
+  `consistent-service-integration-pattern`) — this is the same shape as
+  planner's own in-process `_estimate_project_duration` call, just one level
+  up, in the backend instead of inside a service. Triggered from
+  `handle_delay_result`, once an entry has everything else (phase, delay,
+  every file's equipment counts) persisted.
+- **Grounded citations, not free-form links.** The narrative model is never
+  asked to produce a URL — it's given a closed list of this entry's files
+  (id/name/url/kind/equipment, see `report.EntryFacts`/`FileEvidence`) and
+  writes prose that cites one via a `[[file:ID]]` marker chosen from that
+  list; `report._resolve_citations` is what turns a marker into the real
+  `[name](url)` markdown link the frontend renders, dropping any id that
+  isn't actually in the list. Same closed-vocabulary discipline
+  `plan_normalizer.py` uses for activity classification, applied to
+  evidence instead — a claim like "no equipment is visible in this photo"
+  can only ever point at a photo that was really part of this entry.
 
 ## Open items
 
@@ -344,12 +364,17 @@ same way `analysis_status = "failed"` works today, no separate error path.
   equipment-based phase model. Not needed for a one-photo-per-entry signal
   today, but worth knowing before building anything that expects a time
   series out of it.
-- **delay**: `current_phase_started_at` is simplified to `planned_start +`
-  the matched phase's offset (assumes the phase started on time) — there's
-  no history of when the phase detector *itself* first reported the current
-  phase for a project. A different history than the equipment counts phase
-  now has (see above) — this one would need every `phase.result` persisted
-  per project, not just consumed and discarded.
+- **resolved** — **delay**: `current_phase_started_at` used to be
+  simplified to `planned_start +` the matched phase's offset (assumes the
+  phase started on time), which zeroed the forecast every time a new phase
+  was detected. Now `DelayForecastCommand.current_phase_started_at` carries
+  an estimate from the project's own phase history (every entry's
+  `phase_name`/`phase_confidence`, persisted since the narrative-reports
+  migration) — see `progress.py`'s `estimate_phase_start`: midpoint between
+  the last confident reading of the previous phase and the first reading of
+  the current one, low-confidence off-phase readings ignored as noise. The
+  planned-start fallback only remains for a phase observed since the
+  project's first entry.
 - **delay**: `planned_start` (the project start anchor) is the project's
   *earliest journal entry date*, not a real "project kickoff" date — a
   project whose first uploaded video is well into construction will
@@ -375,17 +400,25 @@ same way `analysis_status = "failed"` works today, no separate error path.
   `plan_normalizer.py` sources its activity → phase → equipment mapping from
   `canonical_plan.xlsx` instead; left in place rather than deleted in case
   anything else still reads it.
-- Blocks 5/6: GPT contracts for the per-video report and the project-level
-  status summary — likely in-process calls (already outside the broker
-  pipeline, since nothing calls them as a service), but not yet specced.
-- No structured phase/delay columns: `handle_phase_result`/`handle_delay_result`
-  still render `PhaseResult`/`DelayForecastResult` straight into
-  `JournalEntry.stage_summary`, one text blob, instead of storing
-  `current_phase`, `delay_days`, etc. as their own fields (unlike
-  `visual_phase_name`/`visual_phase_confidence`, which did get real
-  columns). Fine while the frontend only ever displays that text, but if a
-  screen needs the phase name or delay-days number on their own later,
-  that's another Alembic migration.
+- **resolved** — No structured phase/delay columns: `handle_phase_result`/
+  `handle_delay_result` used to only render `PhaseResult`/
+  `DelayForecastResult` straight into `JournalEntry.stage_summary`, one text
+  blob. `phase_name`/`phase_confidence`/`delay_days`/`expected_completion`
+  are now their own columns too (migration `a1e6c9d2b4f0`) — `stage_summary`
+  still exists and still renders the same prose, but blocks 5/6's narrative
+  generator (`report.py`) needed the numbers as structured facts, not
+  re-parsed out of that prose, so this stopped being optional.
+- Blocks 5/6: the per-entry narrative (block 5) always regenerates before
+  the project-level one (block 6), and both call the LLM once per ready
+  entry — no caching/reuse between them (a project with many entries makes
+  one call per entry, same as `phase`/`delay` already do per entry). Fine at
+  today's volume; a cost/latency concern later is a reason to cache
+  `generate_project_report`'s facts rather than change block 5.
+- Block 5/6 evidence only covers a journal entry's own files, not frames
+  extracted from a video (`ProjectFileOut.photos` is still `[]` — see
+  `media.py`'s `asset_to_file_out` — frame extraction isn't implemented).
+  Once it is, `report.FileEvidence` is the natural place to add extracted
+  frames alongside the entry's uploaded files.
 - Dead-letter handling: a poison message (a handler that keeps failing) has
   no defined destination yet — likely a per-queue DLX once implementation
   starts, not designed in detail here.

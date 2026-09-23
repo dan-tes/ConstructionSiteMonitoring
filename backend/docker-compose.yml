@@ -47,6 +47,13 @@ services:
       INTERNAL_BASE_URL: http://backend:8000
       MEDIA_ROOT: /app/media
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # Blocks 5/6 (report.py) — same Yandex Cloud endpoint planner uses,
+      # optional here: unset means narrative reports are just disabled
+      # (report.py logs it and returns None), not a startup failure — see
+      # that module's docstring.
+      YANDEX_CLOUD_FOLDER: ${YANDEX_CLOUD_FOLDER:-}
+      YANDEX_CLOUD_API_KEY: ${YANDEX_CLOUD_API_KEY:-}
+      YANDEX_CLOUD_MODEL: ${YANDEX_CLOUD_MODEL:-yandexgpt-5-lite/latest}
     depends_on:
       db:
         condition: service_healthy

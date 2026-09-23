@@ -29,6 +29,16 @@ export interface VideoInsight {
   stageSummary?: string
   /** How much and what machinery the model detected across the entry's footage. */
   equipmentSummary?: string
+  /**
+   * Short GPT narrative for this entry (backend's report.py, block 5),
+   * grounded in stageSummary/equipmentSummary's own numbers plus each
+   * uploaded file's own equipment findings. May contain markdown-style
+   * links (`[text](url)`) back to a specific photo/video that supports a
+   * claim in the text — render with `LinkifiedText`, not as plain text.
+   * Undefined/empty if narrative generation isn't configured or failed;
+   * stageSummary/equipmentSummary are unaffected either way.
+   */
+  narrativeReport?: string
   /** Frames pulled from the footage showing machinery or notable events. May be empty. */
   photos?: ProjectFile[]
   /**
@@ -62,8 +72,51 @@ export interface Project {
   name: string
   description: string
   plan: ProjectFile | null
-  /** Project-level summary generated from the latest analysed video. */
+  /**
+   * Project-level status summary (backend's report.py, block 6), generated
+   * from the most recently analysed journal entry. Same as
+   * `VideoInsight.narrativeReport` — may contain markdown-style links back
+   * to a specific photo/video, render with `LinkifiedText`.
+   */
   planStatus: string | null
   entries: JournalEntry[]
   createdAt: string
+  /** Set once the project is closed — no new entries or plan changes after that. */
+  closedAt: string | null
+  /** Plan-vs-actual workbook frozen at close time (backend's progress.py). */
+  finalReport: ProjectFile | null
+}
+
+/** One phase's planned window vs what the journal has observed (backend's progress.py). */
+export interface TimelinePhase {
+  phase: string
+  phaseOrder: number
+  status: 'Completed' | 'In Progress' | 'Planned'
+  plannedStart: string | null
+  plannedEnd: string | null
+  firstDetected: string | null
+  lastDetected: string | null
+  /** When the phase most likely started — the same estimate the delay forecast uses. */
+  estimatedStart: string | null
+}
+
+/** One analysed journal entry — one point on each delay chart. */
+export interface TimelinePoint {
+  entryId: string
+  date: string
+  phase: string
+  phaseConfidence: number | null
+  /** Forecast delay at completion, days; positive = behind schedule. */
+  delayDays: number | null
+  expectedCompletion: string | null
+  /** Effective SPI(t): 1 = on schedule, 0.9 = nine plan-days per ten calendar days. */
+  spiTime: number | null
+}
+
+export interface ProjectTimeline {
+  /** Null until the project has a processed plan and at least one entry. */
+  plannedStart: string | null
+  plannedFinish: string | null
+  phases: TimelinePhase[]
+  points: TimelinePoint[]
 }

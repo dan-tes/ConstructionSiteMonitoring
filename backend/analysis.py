@@ -39,6 +39,15 @@ vision/phase/delay (see `services/*/worker.py`) run real models now: YOLOv8m
 trained ConstructionPhaseModel for phase, the Earned-Schedule forecast for
 delay — see each worker's module docstring for what's faithful to training
 and what's a live-inference simplification.
+
+`handle_delay_result` is also where blocks 5/6 (GPT narrative reports, see
+`report.py`) run: once an entry is `ready`, it builds that entry's
+structured facts (`_build_entry_facts`) and generates its own narrative
+(block 5, `entry.narrative_report`), then `_refresh_plan_status` generates
+the project-level one (block 6, `Project.plan_status`) from the same facts
+for the most recently analysed entry. Both are best-effort — see
+`report.py`'s module docstring for why a missing/failed narrative never
+fails the entry.
 """
 
 from __future__ import annotations
@@ -56,6 +65,7 @@ from sqlalchemy.orm import selectinload
 if TYPE_CHECKING:
     from fastapi import BackgroundTasks
 
+import report
 from config import settings
 from database import SessionLocal
 from integrations import broker
@@ -75,8 +85,10 @@ from integrations.schemas import (
     VisualPhaseCommand,
     VisualPhaseResult,
 )
+from media import file_url
 from models import EquipmentObservation, JournalEntry, MediaAsset, PlanStage, Project
 from plan_parser import ParsedPlan
+from progress import PhaseObservation, estimate_phase_start
 
 # How many days of a project's equipment-observation history to feed the
 # phase model — see services/phase/worker.py's WINDOW_SIZE (128) docstring;
@@ -210,6 +222,61 @@ async def _project_planned_start(db, project_id: uuid.UUID) -> date | None:
     ).scalar_one_or_none()
 
 
+async def _current_phase_started_at(
+    db, project_id: uuid.UUID, current_phase: str, as_of_date: date
+) -> date | None:
+    """The delay model's `current_phase_started_at`, estimated from every
+    phase reading this project has up to `as_of_date` — see
+    progress.estimate_phase_start. Includes the entry being analysed right
+    now, so its phase_name must already be flushed/committed."""
+    rows = (
+        await db.execute(
+            select(JournalEntry.date, JournalEntry.phase_name, JournalEntry.phase_confidence).where(
+                JournalEntry.project_id == project_id,
+                JournalEntry.phase_name.is_not(None),
+                JournalEntry.date <= as_of_date,
+            )
+        )
+    ).all()
+    return estimate_phase_start(
+        [PhaseObservation(date=d, phase=p, confidence=c) for d, p, c in rows], current_phase
+    )
+
+
+async def _build_entry_facts(db, entry: JournalEntry) -> report.EntryFacts:
+    """Assembles blocks 5/6's structured input (see report.py's EntryFacts)
+    from what's already persisted on this entry and its files: the phase/
+    delay numbers `stage_summary` renders into prose, plus each file's own
+    equipment_counts (not the day-merged EquipmentObservation — the
+    narrative needs to point at a specific photo/video, see
+    report.FileEvidence). Called once the entry's phase_name/delay_days
+    columns are set, so callers should commit those first if this is
+    running inside the same session."""
+    project = await db.get(Project, entry.project_id)
+    media = (
+        await db.execute(select(MediaAsset).where(MediaAsset.entry_id == entry.id))
+    ).scalars().all()
+    files = [
+        report.FileEvidence(
+            asset_id=asset.id,
+            name=asset.original_name,
+            url=file_url(asset.id),
+            kind=asset.kind,
+            equipment=json.loads(asset.equipment_counts) if asset.equipment_counts else {},
+        )
+        for asset in media
+    ]
+    return report.EntryFacts(
+        project_name=project.name if project else "",
+        entry_date=entry.date,
+        phase_name=entry.phase_name,
+        phase_confidence=entry.phase_confidence,
+        delay_days=entry.delay_days,
+        expected_completion=entry.expected_completion,
+        files=files,
+    )
+
+
 async def _mark_entry_failed(entry_id: uuid.UUID, step: str, error: str | None) -> None:
     log.error("analysis step %r failed for entry %s: %s", step, entry_id, error)
     async with SessionLocal() as db:
@@ -219,23 +286,48 @@ async def _mark_entry_failed(entry_id: uuid.UUID, step: str, error: str | None) 
             await db.commit()
 
 
-async def _refresh_plan_status(db, project_id: uuid.UUID) -> None:
-    """Project-level summary = stage summary of the most recently analysed
-    journal entry."""
-    latest = (
-        await db.execute(
-            select(JournalEntry)
-            .where(
-                JournalEntry.project_id == project_id,
-                JournalEntry.analysis_status == "ready",
+async def _refresh_plan_status(project_id: uuid.UUID) -> None:
+    """Block 6 (диаграмма: блок 6) — project-level status, grounded in the
+    most recently analysed journal entry's structured facts (same facts
+    block 5 uses for that entry's own narrative, see report.py and
+    _build_entry_facts). Falls back to that entry's plain stage_summary
+    when narrative generation is unavailable or fails (no YANDEX_CLOUD_*
+    key configured, or the call errored) rather than leaving plan_status
+    blank — report.generate_project_report already returns None in exactly
+    that case, see its docstring.
+
+    Runs its own sessions (rather than reusing a caller's) because it makes
+    a network call to the LLM in between reading the facts and writing the
+    result — same reason handle_delay_result splits its own work across two
+    sessions around that call."""
+    async with SessionLocal() as db:
+        latest = (
+            await db.execute(
+                select(JournalEntry)
+                .where(
+                    JournalEntry.project_id == project_id,
+                    JournalEntry.analysis_status == "ready",
+                )
+                .order_by(JournalEntry.analyzed_at.desc())
+                .limit(1)
             )
-            .order_by(JournalEntry.analyzed_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    project = await db.get(Project, project_id)
-    if project is not None:
-        project.plan_status = latest.stage_summary if latest else None
+        ).scalar_one_or_none()
+        if latest is None:
+            project = await db.get(Project, project_id)
+            if project is not None:
+                project.plan_status = None
+                await db.commit()
+            return
+        facts = await _build_entry_facts(db, latest)
+        fallback = latest.stage_summary
+
+    narrative = await asyncio.to_thread(report.generate_project_report, facts)
+
+    async with SessionLocal() as db:
+        project = await db.get(Project, project_id)
+        if project is not None:
+            project.plan_status = narrative or fallback
+            await db.commit()
 
 
 async def handle_plan_result(envelope: Envelope[PlanNormalizeResult]) -> None:
@@ -362,6 +454,13 @@ async def handle_vision_result(envelope: Envelope[DetectResult]) -> None:
             # entry), but falls back to today rather than raising if it is.
             obs_date = entry.date if entry is not None else date.today()
             await _upsert_equipment_observation(db, asset.project_id, obs_date, result.counts or [])
+            # This file's OWN counts, kept separately from the day-merged
+            # EquipmentObservation above — see MediaAsset.equipment_counts
+            # and report.py's FileEvidence: the block-5 narrative cites a
+            # specific photo/video's own findings, not just the day total.
+            asset.equipment_counts = json.dumps(
+                {c.equipment_class: c.count for c in (result.counts or [])}
+            )
             asset.analysis_status = "ready"
         await db.commit()
 
@@ -458,9 +557,15 @@ async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
         if entry is None:
             return
         entry.stage_summary = _summarize_phase(result)
+        entry.phase_name = result.phase_name
+        entry.phase_confidence = result.confidence
         plan = await _load_plan(db, entry.project_id)
         planned_start = await _project_planned_start(db, entry.project_id)
         as_of_date = entry.date
+        await db.flush()
+        phase_started_at = await _current_phase_started_at(
+            db, entry.project_id, result.phase_name, as_of_date
+        )
         await db.commit()
 
     if planned_start is None:
@@ -478,6 +583,7 @@ async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
         current_phase=result.phase_name,
         as_of_date=as_of_date,
         phase_confidence=result.confidence if result.confidence is not None else 1.0,
+        current_phase_started_at=phase_started_at,
     )
     body = _envelope(entry_id, command).model_dump_json().encode()
     await broker.publish(broker.DELAY_COMMAND, body)
@@ -495,10 +601,28 @@ async def handle_delay_result(envelope: Envelope[DelayForecastResult]) -> None:
         if entry is None:
             return
         entry.stage_summary = _summarize_delay(entry.stage_summary, result)
+        entry.delay_days = result.delay_days
+        entry.expected_completion = result.expected_completion
+        entry.spi_time = result.spi_time
         entry.analysis_status = "ready"
         entry.analyzed_at = datetime.now(timezone.utc)
-        await _refresh_plan_status(db, entry.project_id)
+        facts = await _build_entry_facts(db, entry)
+        project_id = entry.project_id
         await db.commit()
+
+    # Block 5 — best-effort, never fails the entry: stage_summary above is
+    # already committed and is what the rest of the pipeline actually reads;
+    # see report.py's module docstring for why this runs in-process rather
+    # than as another broker leg, and asyncio.to_thread for the same reason
+    # services/planner's worker offloads its own (synchronous) LLM call.
+    narrative = await asyncio.to_thread(report.generate_entry_report, facts)
+    async with SessionLocal() as db:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is not None:
+            entry.narrative_report = narrative
+            await db.commit()
+
+    await _refresh_plan_status(project_id)
 
 
 async def start_consumers() -> None:

@@ -1,9 +1,11 @@
-import { ArrowLeft, Download, FileSpreadsheet, HardHat, Table2, Trash2 } from 'lucide-react'
+import { ArrowLeft, Download, FileSpreadsheet, HardHat, Lock, Table2, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useParams } from 'react-router-dom'
 import { FileDropZone } from '../components/FileDropZone'
 import { JournalEntryCard } from '../components/JournalEntryCard'
 import { EditableText } from '../components/EditableText'
+import { DelayChartsSection } from '../components/delayCharts/DelayChartsSection'
+import { LinkifiedText } from '../components/LinkifiedText'
 import { PrimaryButton } from '../components/ui'
 import { useAuth } from '../context/AuthContext'
 import { useProjects } from '../context/ProjectsContext'
@@ -19,6 +21,7 @@ export function ProjectDetailPage() {
     updateProject,
     setProjectPlan,
     downloadCanonicalPlan,
+    closeProject,
     addJournalEntry,
   } = useProjects()
   const project = id ? getProject(id) : undefined
@@ -28,6 +31,8 @@ export function ProjectDetailPage() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [entryError, setEntryError] = useState<string | null>(null)
   const [planError, setPlanError] = useState<string | null>(null)
+  const [closeError, setCloseError] = useState<string | null>(null)
+  const [isClosing, setIsClosing] = useState(false)
   const [notFound, setNotFound] = useState(false)
 
   const planInsightStatus = project?.plan?.insight?.status
@@ -61,9 +66,13 @@ export function ProjectDetailPage() {
     )
   }
 
+  const isClosed = project.closedAt !== null
   const entriesWithMedia = project.entries.filter((entry) => entry.media.length > 0)
   const videos = entriesWithMedia.flatMap((entry) => entry.media)
   const isAnalyzing = videos.length > 0 && !project.planStatus
+  // Refetch the charts' series whenever an entry appears, disappears or
+  // finishes analysis (the context's own polling updates these statuses).
+  const timelineKey = project.entries.map((e) => `${e.id}:${e.insight?.status}`).join('|')
 
   const changePlan = (file: File | null) => {
     setPlanError(null)
@@ -72,18 +81,37 @@ export function ProjectDetailPage() {
     )
   }
 
-  const handleDownloadCanonicalPlan = async () => {
-    setPlanError(null)
+  const handleDownloadReport = async () => {
+    setCloseError(null)
     try {
       const blob = await downloadCanonicalPlan(project.id)
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
-      link.download = `${project.name || 'plan'}_canonical.xlsx`
+      link.download = `${project.name || 'project'}_plan_fact.xlsx`
       link.click()
       URL.revokeObjectURL(url)
     } catch (err) {
-      setPlanError(err instanceof Error ? err.message : 'Не удалось скачать канонический план')
+      setCloseError(err instanceof Error ? err.message : 'Не удалось скачать отчёт')
+    }
+  }
+
+  const handleCloseProject = async () => {
+    if (isClosing) return
+    if (
+      !window.confirm(
+        'Закрыть объект? Итоговый отчёт «план / факт» будет зафиксирован, новые видео, фото и изменения плана станут недоступны.',
+      )
+    )
+      return
+    setIsClosing(true)
+    setCloseError(null)
+    try {
+      await closeProject(project.id)
+    } catch (err) {
+      setCloseError(err instanceof Error ? err.message : 'Не удалось закрыть объект')
+    } finally {
+      setIsClosing(false)
     }
   }
 
@@ -176,25 +204,19 @@ export function ProjectDetailPage() {
                     <Download className="h-4 w-4" />
                     Оригинал
                   </a>
-                  {planInsightStatus === 'ready' && (
+                  {!isClosed && (
                     <button
                       type="button"
-                      onClick={() => void handleDownloadCanonicalPlan()}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-site-600 px-3 py-2 text-sm font-medium text-site-200 transition hover:border-safety-400 hover:text-safety-300"
+                      onClick={() => changePlan(null)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-site-600 px-3 py-2 text-sm font-medium text-site-300 transition hover:border-red-500/50 hover:text-red-400"
                     >
-                      <Table2 className="h-4 w-4" />
-                      Канонический план
+                      <Trash2 className="h-4 w-4" />
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => changePlan(null)}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-site-600 px-3 py-2 text-sm font-medium text-site-300 transition hover:border-red-500/50 hover:text-red-400"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
                 </div>
               </div>
+            ) : isClosed ? (
+              <p className="text-sm text-site-500">План не был загружен.</p>
             ) : (
               <FileDropZone
                 label="Загрузить план объекта"
@@ -237,9 +259,10 @@ export function ProjectDetailPage() {
               </p>
             ) : (
               <>
-                <p className="whitespace-pre-line text-sm leading-relaxed text-site-300">
-                  {project.planStatus}
-                </p>
+                <LinkifiedText
+                  text={project.planStatus ?? ''}
+                  className="whitespace-pre-line text-sm leading-relaxed text-site-300"
+                />
                 <p className="mt-3 text-xs text-site-500">
                   Сформировано автоматически по результатам анализа загруженных видео и фото
                 </p>
@@ -248,65 +271,78 @@ export function ProjectDetailPage() {
           </div>
         </section>
 
+        <DelayChartsSection projectId={project.id} refreshKey={timelineKey} />
+
         <section className="mt-10">
           <h2 className="font-display text-lg font-semibold text-site-100">Видео и фото объекта</h2>
 
-          <form
-            onSubmit={handleSubmitEntry}
-            className="mt-3 flex flex-col gap-3 rounded-xl border border-site-700 bg-site-900/50 p-4"
-          >
-            <FileDropZone
-              label="Загрузить видео или фото"
-              hint="Можно выбрать несколько файлов"
-              accept="video/*,image/*"
-              multiple
-              onFiles={handleAddMedia}
-            />
-
-            <label className="flex flex-col gap-1.5 text-sm text-site-300">
-              Дата съёмки
-              <input
-                type="date"
-                value={entryDate}
-                max={todayDateString()}
-                onChange={(e) => setEntryDate(e.target.value)}
-                className="w-fit rounded-lg border border-site-600 bg-site-900 px-3 py-2 text-site-100 focus:border-safety-400 focus:outline-none"
+          {isClosed ? (
+            <p className="mt-3 flex items-center gap-2 rounded-xl border border-site-700 bg-site-900/50 p-4 text-sm text-site-400">
+              <Lock className="h-4 w-4 shrink-0" />
+              Объект закрыт — новые видео и фото не принимаются.
+            </p>
+          ) : (
+            <form
+              onSubmit={handleSubmitEntry}
+              className="mt-3 flex flex-col gap-3 rounded-xl border border-site-700 bg-site-900/50 p-4"
+            >
+              <FileDropZone
+                label="Загрузить видео или фото"
+                hint="Можно выбрать несколько файлов"
+                accept="video/*,image/*"
+                multiple
+                onFiles={handleAddMedia}
               />
-            </label>
 
-            {mediaFiles.length > 0 && (
-              <ul className="flex flex-wrap gap-2">
-                {mediaFiles.map((file, index) => (
-                  <li
-                    key={`${file.name}-${index}`}
-                    className="flex items-center gap-2 rounded-lg border border-site-600 bg-site-800 px-2.5 py-1.5 text-xs text-site-300"
-                  >
-                    {file.name}
-                    <button
-                      type="button"
-                      onClick={() => setMediaFiles((prev) => prev.filter((_, i) => i !== index))}
-                      className="text-site-500 hover:text-red-400"
-                      aria-label={`Убрать ${file.name}`}
+              <label className="flex flex-col gap-1.5 text-sm text-site-300">
+                Дата съёмки
+                <input
+                  type="date"
+                  value={entryDate}
+                  max={todayDateString()}
+                  onChange={(e) => setEntryDate(e.target.value)}
+                  className="w-fit rounded-lg border border-site-600 bg-site-900 px-3 py-2 text-site-100 focus:border-safety-400 focus:outline-none"
+                />
+              </label>
+
+              {mediaFiles.length > 0 && (
+                <ul className="flex flex-wrap gap-2">
+                  {mediaFiles.map((file, index) => (
+                    <li
+                      key={`${file.name}-${index}`}
+                      className="flex items-center gap-2 rounded-lg border border-site-600 bg-site-800 px-2.5 py-1.5 text-xs text-site-300"
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
+                      {file.name}
+                      <button
+                        type="button"
+                        onClick={() => setMediaFiles((prev) => prev.filter((_, i) => i !== index))}
+                        className="text-site-500 hover:text-red-400"
+                        aria-label={`Убрать ${file.name}`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
 
-            {entryError && (
-              <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3.5 py-2.5 text-sm text-red-300">
-                {entryError}
-              </p>
-            )}
+              {entryError && (
+                <p className="rounded-lg border border-red-900/60 bg-red-950/40 px-3.5 py-2.5 text-sm text-red-300">
+                  {entryError}
+                </p>
+              )}
 
-            <div className="flex justify-end">
-              <PrimaryButton type="submit" isLoading={isSubmitting} disabled={mediaFiles.length === 0}>
-                Добавить
-              </PrimaryButton>
-            </div>
-          </form>
+              <div className="flex justify-end">
+                <PrimaryButton
+                  type="submit"
+                  isLoading={isSubmitting}
+                  disabled={mediaFiles.length === 0}
+                >
+                  Добавить
+                </PrimaryButton>
+              </div>
+            </form>
+          )}
 
           <div className="mt-6 flex flex-col gap-3">
             {entriesWithMedia.length === 0 ? (
@@ -319,6 +355,62 @@ export function ProjectDetailPage() {
               ))
             )}
           </div>
+        </section>
+
+        <section className="mt-10">
+          <h2 className="font-display text-lg font-semibold text-site-100">Отчёт «план / факт»</h2>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-site-700 bg-site-900/50 p-4">
+            {isClosed ? (
+              <>
+                <p className="flex items-center gap-2 text-sm text-site-300">
+                  <Lock className="h-4 w-4 shrink-0 text-safety-400" />
+                  Объект закрыт {new Date(project.closedAt!).toLocaleDateString('ru-RU')}
+                </p>
+                {project.finalReport && (
+                  <a
+                    href={project.finalReport.url}
+                    download={project.finalReport.name}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-site-600 px-3 py-2 text-sm font-medium text-site-200 transition hover:border-safety-400 hover:text-safety-300"
+                  >
+                    <Download className="h-4 w-4" />
+                    Итоговый отчёт «план / факт»
+                  </a>
+                )}
+              </>
+            ) : (
+              <>
+                <p className="max-w-lg text-sm text-site-400">
+                  Канонический план со статусами фаз, фактическим ходом работ и историей выездов.
+                  Скачать можно в любой момент — чего ещё нет, останется пустым. При закрытии
+                  объекта отчёт фиксируется как итоговый.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleDownloadReport()}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-site-600 px-3 py-2 text-sm font-medium text-site-200 transition hover:border-safety-400 hover:text-safety-300"
+                  >
+                    <Table2 className="h-4 w-4" />
+                    Скачать отчёт
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCloseProject()}
+                    disabled={isClosing}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-site-600 px-3 py-2 text-sm font-medium text-site-200 transition hover:border-red-500/50 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Lock className="h-4 w-4" />
+                    {isClosing ? 'Закрываем…' : 'Закрыть объект'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+          {closeError && (
+            <p className="mt-3 rounded-lg border border-red-900/60 bg-red-950/40 px-3.5 py-2.5 text-sm text-red-300">
+              {closeError}
+            </p>
+          )}
         </section>
       </main>
     </div>

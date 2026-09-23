@@ -27,11 +27,15 @@ service's message shape to that function's arguments:
   entry date, resolved by the backend (see analysis.py's
   `_project_planned_start`) since the plan format intentionally carries no
   dates.
-- `current_phase_started_at` is simplified to `planned_start +
-  phase_start_offset_days` — we don't yet track when the phase detector
-  first reported the current phase for this project, only what it reports
-  on each video, so "started on time" is the working assumption until that
-  history exists (see backend/integrations/README.md Open items).
+- `current_phase_started_at` comes from `command.current_phase_started_at`:
+  the backend estimates it from the project's own phase history (see
+  backend/progress.py's `estimate_phase_start`), as the notebook requires
+  ("должен приходить из истории фаз, а не выдумываться модулем 4"). Only
+  when that history has no earlier phase to measure from (None) does this
+  fall back to `planned_start + phase_start_offset_days`. That fallback
+  used to be the only behaviour, and it zeroed the forecast every time a
+  new phase was detected: with the phase assumed to start on plan, earned
+  schedule equals the calendar until the phase overruns its planned end.
 
 No matching stage (empty plan, or `current_phase` not found in it) means
 there's nothing to forecast from — returns a `done` result with
@@ -176,9 +180,7 @@ def compute(command: DelayForecastCommand) -> DelayForecastResult:  # EXTENSION 
     # phase's activities run in parallel, so offsets are computed as
     # *fractions* of that sum and rescaled onto the real project timeline
     # (project_duration_days, i.e. project_network_duration) rather than
-    # used as day counts directly. current_phase_started_at assumes the
-    # phase started exactly on schedule (no history of when it actually
-    # started; see backend/integrations/README.md Open items).
+    # used as day counts directly.
     activity_duration_sum = sum(s.planned_duration_days for s in stages)
     planned_duration_days = (
         command.project_duration_days
@@ -195,17 +197,19 @@ def compute(command: DelayForecastCommand) -> DelayForecastResult:  # EXTENSION 
     # date + timedelta only honors timedelta.days, so a fractional offset
     # must be rounded first or it's silently floored (dropping up to
     # ~1 day) rather than rounded.
-    current_phase_started_at = command.planned_start + timedelta(
-        days=round(phase_start_offset_days)
+    # Planned start only as a fallback — see the module docstring.
+    current_phase_started_at = command.current_phase_started_at or (
+        command.planned_start + timedelta(days=round(phase_start_offset_days))
     )
     log.info(
         "found phase %r at offset %.1f/%.0f days (scale %.2fx from activity-duration sum), "
-        "assumed started %s, status date %s",
+        "started %s (%s), status date %s",
         matched.phase,
         phase_start_offset_days,
         planned_duration_days,
         scale,
         current_phase_started_at.isoformat(),
+        "observed" if command.current_phase_started_at else "assumed on plan",
         command.as_of_date.isoformat(),
     )
 
@@ -234,6 +238,7 @@ def compute(command: DelayForecastCommand) -> DelayForecastResult:  # EXTENSION 
         delay_days=delay_days,
         expected_completion=forecast.forecast_finish_date,
         confidence=forecast.confidence,
+        spi_time=forecast.effective_spi_time,
     )
 
 

@@ -77,6 +77,13 @@ class VideoInsightOut(CamelModel):
     status: str  # pending | analyzing | ready | failed
     stage_summary: str | None = None
     equipment_summary: str | None = None
+    # Block 5 (see backend/report.py) — a short GPT narrative grounded in
+    # this entry's phase/delay facts and each file's own equipment findings,
+    # with markdown links (`[name](url)`) back to the specific photo/video
+    # supporting a given claim. None if narrative generation is unavailable
+    # (no YANDEX_CLOUD_* key configured) or failed — stage_summary/
+    # equipment_summary above are still the load-bearing fields.
+    narrative_report: str | None = None
     photos: list[ProjectFileOut] = []
     # Experimental, observational-only signal from services/visual_phase,
     # computed once per entry against one representative file — arrives
@@ -111,6 +118,43 @@ class ProjectOut(CamelModel):
     plan_status: str | None = None
     entries: list[JournalEntryOut] = []
     created_at: datetime
+    closed_at: datetime | None = None
+    # Plan-vs-actual workbook frozen at close time (see progress.py).
+    final_report: ProjectFileOut | None = None
+
+
+class TimelinePhaseOut(CamelModel):
+    phase: str
+    phase_order: int
+    status: str  # Completed | In Progress | Planned
+    planned_start: date_type | None = None
+    planned_end: date_type | None = None
+    first_detected: date_type | None = None
+    last_detected: date_type | None = None
+    estimated_start: date_type | None = None
+
+
+class TimelinePointOut(CamelModel):
+    """One analysed journal entry — one point on each delay chart."""
+
+    entry_id: uuid.UUID
+    date: date_type
+    phase: str
+    phase_confidence: float | None = None
+    delay_days: int | None = None
+    expected_completion: date_type | None = None
+    spi_time: float | None = None
+
+
+class ProjectTimelineOut(CamelModel):
+    """Data for the project page's delay charts (see progress.py). planned_*
+    are None until the project has both a processed plan and at least one
+    journal entry to anchor it on the calendar."""
+
+    planned_start: date_type | None = None
+    planned_finish: date_type | None = None
+    phases: list[TimelinePhaseOut] = []
+    points: list[TimelinePointOut] = []
 
 
 class ProjectCreate(BaseModel):

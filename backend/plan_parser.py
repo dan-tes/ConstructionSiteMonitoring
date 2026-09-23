@@ -176,8 +176,11 @@ class CanonicalExportPhase:
 
 
 def build_canonical_workbook(
-    project_id: str, phases: list[CanonicalExportPhase], project_duration_days: float
-) -> bytes:
+    project_id: str,
+    phases: list[CanonicalExportPhase],
+    project_duration_days: float,
+    statuses: dict[str, str] | None = None,
+) -> openpyxl.Workbook:
     """The write side of the canonical format: one `.xlsx` with the same
     21-column header `parse_plan_workbook` reads, so re-uploading this file
     round-trips cleanly through it. One synthetic activity row stands in for
@@ -187,7 +190,13 @@ def build_canonical_workbook(
     `planner` service's LLM fallback. Lets a project be inspected/edited in
     the canonical shape and re-uploaded, rather than only ever consumed
     read-only.
+
+    `statuses` fills the `status` column per phase (see progress.py — the
+    live "fact" export); phases missing from it stay "Planned". Returns the
+    open workbook rather than bytes so progress.py can append its own
+    sheets — `parse_plan_workbook` only ever reads the activities sheet.
     """
+    statuses = statuses or {}
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.title = "activities"
@@ -208,7 +217,7 @@ def build_canonical_workbook(
                 0,  # unit_cost
                 0,  # planned_cost
                 1.0,  # criticality — this row *is* the whole phase
-                "Planned",  # status
+                statuses.get(p.phase, "Planned"),  # status
                 1,  # critical_path
                 p.phase_order,  # critical_path_position
                 project_duration_days,
@@ -219,6 +228,10 @@ def build_canonical_workbook(
                 "{}",  # expected_equipment_descriptions — not tracked per-phase
             ]
         )
+    return workbook
+
+
+def workbook_bytes(workbook: openpyxl.Workbook) -> bytes:
     buf = io.BytesIO()
     workbook.save(buf)
     return buf.getvalue()

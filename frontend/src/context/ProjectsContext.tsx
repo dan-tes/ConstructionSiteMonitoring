@@ -23,9 +23,10 @@ interface ProjectsContextValue {
   updateProject: (id: string, patch: { name?: string; description?: string }) => Promise<void>
   setProjectPlan: (id: string, file: File | null) => Promise<void>
   downloadCanonicalPlan: (id: string) => Promise<Blob>
+  closeProject: (id: string) => Promise<void>
   addJournalEntry: (id: string, mediaFiles: File[], author: string, date: string) => Promise<void>
-  /** Re-fetch one journal entry's combined analysis and merge it in. Returns the new status. */
-  refreshEntry: (projectId: string, entryId: string) => Promise<VideoInsight['status'] | undefined>
+  /** Re-fetch one journal entry's combined analysis and merge it in. Returns the new insight. */
+  refreshEntry: (projectId: string, entryId: string) => Promise<VideoInsight | undefined>
 }
 
 const ProjectsContext = createContext<ProjectsContextValue | null>(null)
@@ -110,6 +111,13 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
 
   const downloadCanonicalPlan = useCallback((id: string) => projectsApi.downloadCanonicalPlan(id), [])
 
+  const closeProject = useCallback(
+    async (id: string) => {
+      upsert(await projectsApi.close(id))
+    },
+    [upsert],
+  )
+
   const patchEntry = useCallback((projectId: string, entryId: string, insight?: VideoInsight) => {
     setProjects((prev) =>
       prev.map((p) =>
@@ -127,23 +135,41 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     async (projectId: string, entryId: string) => {
       const entry = await projectsApi.getEntry(projectId, entryId)
       patchEntry(projectId, entryId, entry.insight)
-      // A finished entry may have produced a fresh project-level summary.
+      // A finished entry may have produced a fresh project-level summary
+      // (block 6) — re-fetched every time this runs while not pending
+      // (not just once), since that summary — like the entry's own
+      // narrativeReport below — is best-effort and can still be in flight
+      // a few seconds after the entry itself turns "ready".
       if (!isPending(entry.insight?.status)) {
         projectsApi.get(projectId).then(upsert).catch(() => {})
       }
-      return entry.insight?.status
+      return entry.insight
     },
     [patchEntry, upsert],
   )
+
+  // How long to keep polling a "ready" entry that has no narrativeReport
+  // yet — backend's report.py generates it (and the block-6 project
+  // summary above) *after* the entry itself is marked ready (a real LLM
+  // call still in flight at that point, see analysis.py's
+  // handle_delay_result), so stopping the instant status flips would miss
+  // it whenever that call takes a few seconds. Bounded so a narrative
+  // that's disabled/failed (report.py's normal "no key configured" case)
+  // doesn't poll forever.
+  const NARRATIVE_GRACE_MS = 20000
 
   const pollUntilReady = useCallback(
     (projectId: string, entryId: string) => {
       const timers = pollTimers.current
       if (timers.has(entryId)) return
+      let readyAt: number | null = null
       const timer = setInterval(async () => {
         try {
-          const next = await refreshEntry(projectId, entryId)
-          if (!isPending(next)) {
+          const insight = await refreshEntry(projectId, entryId)
+          if (isPending(insight?.status)) return
+          if (readyAt === null) readyAt = Date.now()
+          const awaitingNarrative = insight?.status === 'ready' && !insight.narrativeReport
+          if (!awaitingNarrative || Date.now() - readyAt > NARRATIVE_GRACE_MS) {
             clearInterval(timer)
             timers.delete(entryId)
           }
@@ -177,6 +203,7 @@ export function ProjectsProvider({ children }: { children: ReactNode }) {
     updateProject,
     setProjectPlan,
     downloadCanonicalPlan,
+    closeProject,
     addJournalEntry,
     refreshEntry,
   }

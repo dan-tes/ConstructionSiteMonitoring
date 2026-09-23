@@ -37,6 +37,7 @@ class DelayForecastCommand(BaseModel):
     current_phase: str
     as_of_date: date
     phase_confidence: float = 1.0
+    current_phase_started_at: date | None = None
 
 
 class DelayForecastResult(BaseModel):
@@ -44,4 +45,5 @@ class DelayForecastResult(BaseModel):
     delay_days: int | None = None
     expected_completion: date | None = None
     confidence: float | None = None
+    spi_time: float | None = None
     error: str | None = None
