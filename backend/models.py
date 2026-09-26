@@ -128,10 +128,22 @@ class JournalEntry(Base):
     analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Visual-phase signal (services/visual_phase), computed once per entry
-    # against one representative file — observational only, does not feed
-    # the delay forecast; see analysis.py's handle_visual_phase_result.
+    # against one representative file. Feeds the entry's final phase_name
+    # through the phase ensemble (phase_ensemble.py) together with the
+    # equipment-based phase; on its own these columns just record what the
+    # photo classifier said — see analysis.py's handle_visual_phase_result.
     visual_phase_name: Mapped[str | None] = mapped_column(String(30), nullable=True)
     visual_phase_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Ансамбль фазы (phase_ensemble.py): итоговые phase_name/phase_confidence
+    # ниже — это объединение фазы по технике и по снимку, а не сырой ответ
+    # services/phase. Сырые распределения (JSON {фаза: вероятность}) хранятся
+    # здесь — чтобы было видно, что сказал каждый сигнал.
+    equipment_phase_probs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    visual_phase_probs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pending | done | failed | timeout — ждать ли ещё visual_phase перед
+    # тем, как записать итоговую фазу (analysis._maybe_finalize_phase).
+    visual_phase_status: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # The same phase/delay numbers `stage_summary` already renders into one
     # text blob, kept as their own columns too — see report.py/analysis.py's

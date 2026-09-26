@@ -40,11 +40,14 @@ windows are `WINDOW_SIZE` real calendar days, with gaps never modelled at
 all), which is a materially worse problem than only *missing historical
 context* the earlier docstring here described.
 
-Still a known simplification versus training: this always runs the
-noise-free case for the two detector-confidence features (`visible`,
-`confidence` both 1.0 on every day with data) rather than the miss/
-false-positive-perturbed values the training data simulated — a reasonable
-stand-in, not a faithful reproduction of training-time inference.
+Features and the dense window are built by features.py — the same code
+the training script (phase_determination/train_phase_v2.py) uses, so the
+window the model sees here matches training. The checkpoint's
+`config.feature_version` picks the layout: v1 is the original notebook
+checkpoint (which had a train/serve mismatch — its training counts were
+ground truth, not detector output, and prod fed `visible`/`confidence` as
+constant 1.0), v2 is trained on simulated detector output and additionally
+knows which days had a real photo vs forward-filled ones — see features.py.
 """
 
 from __future__ import annotations
@@ -52,15 +55,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import aio_pika
 import numpy as np
-import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer
 
+from features import FEATURE_VERSION_LEGACY, build_phase_meta, build_phase_structured, build_window
 from model import ConstructionPhaseModel
 from schemas import DailyEquipmentCounts, Envelope, PhaseCommand, PhaseResult
 
@@ -74,112 +77,29 @@ RESULT_ROUTING_KEY = "phase.result"
 COMMAND_QUEUE = "phase.command.q"
 
 DATA_DIR = Path(__file__).parent / "data"
-CHECKPOINT_PATH = Path(__file__).parent / "weights" / "best.pt"
+WEIGHTS_DIR = Path(__file__).parent / "weights"
+# Ансамбль моделей по технике: "путь=вес,путь=вес" (пути относительно
+# weights/). По умолчанию — v3 (best.pt: v2, дообученная на 60 размеченных
+# таймлапс-стройках, phase_determination/finetune_timelapse.py) и v2 без
+# таймлапсов (best_base.pt), веса 3:1 — вместе с visual_phase это лучший
+# вариант held-out оценки phase_determination/eval_all.py (~66% по дням).
+# Вероятности объединяются log-линейно: log p = sum w_i log p_i.
+# PHASE_CHECKPOINT=<путь> — одна модель, для бенчмарка
+# (phase_determination/timelapse_phase_eval.py) тем же прод-кодом.
+if os.environ.get("PHASE_CHECKPOINT"):
+    CHECKPOINTS = [(Path(os.environ["PHASE_CHECKPOINT"]), 1.0)]
+else:
+    CHECKPOINTS = [
+        (WEIGHTS_DIR / spec.split("=")[0].strip(), float(spec.split("=")[1]) if "=" in spec else 1.0)
+        for spec in os.environ.get("PHASE_CHECKPOINTS", "best.pt=3,best_base.pt=1").split(",")
+    ]
 TEXT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-def _build_phase_meta() -> tuple[list[str], list[str], dict[str, np.ndarray], pd.DataFrame]:
-    """Reproduces retrain_weighted_equipment.py's feature construction
-    exactly — same groupby, same phase_text template, same per-phase
-    equipment *prevalence* — so the sentence-transformer embeddings and the
-    structured features match what the checkpoint was trained on.
-
-    `phase_equipment` used to be a binary set (any activity of that phase
-    ever using class X counted the same as every activity using it) —
-    confirmed by direct testing to make the model over-predict MEP for
-    equipment mixes that only weakly resemble it (tower_crane/hanging_hook
-    appear in just 21% of MEP's activities but 91% of Structural Frame's,
-    yet both were fed in as an identical "yes, expected"). It's now each
-    class's actual prevalence fraction within that phase's activities — see
-    phase_determination/retrain_weighted_equipment.py, which retrained
-    `best.pt` against this same feature and confirmed the fix (test
-    accuracy 89%, MEP recall dropping as it stopped being the over-eager
-    default) on held-out projects, not just the one case that found it."""
-    activities = pd.read_csv(DATA_DIR / "activities_with_equipment.csv")
-    equipment_desc = pd.read_csv(DATA_DIR / "equipment_descriptions.csv")
-    activities["expected_equipment"] = activities["expected_equipment"].apply(
-        lambda x: eval(x) if isinstance(x, str) else x
-    )
-
-    equipment_classes = equipment_desc["equipment_class"].tolist()
-    equipment_to_id = {e: i for i, e in enumerate(equipment_classes)}
-    num_equipment = len(equipment_classes)
-    equipment_descriptions = dict(
-        zip(equipment_desc["equipment_class"], equipment_desc["description"])
-    )
-
-    phase_meta = (
-        activities.groupby(["phase", "phase_order"], as_index=False)
-        .agg(
-            activities=("activity_name", lambda x: list(dict.fromkeys(x))),
-            duration_days=("planned_duration_days", "sum"),
-            criticality=("criticality", "mean"),
-        )
-        .sort_values("phase_order")
-        .reset_index(drop=True)
-    )
-    phase_names = phase_meta["phase"].tolist()
-
-    phase_equipment_prevalence: dict[str, np.ndarray] = {}
-    phase_texts = []
-    for _, row in phase_meta.iterrows():
-        phase = row["phase"]
-        phase_activities = activities.loc[activities["phase"] == phase, "expected_equipment"]
-        n_activities = len(phase_activities)
-        counts = np.zeros(num_equipment, dtype=np.float32)
-        for eqs in phase_activities:
-            for e in eqs:
-                if e in equipment_to_id:
-                    counts[equipment_to_id[e]] += 1
-        prevalence = counts / max(n_activities, 1)
-        phase_equipment_prevalence[phase] = prevalence
-
-        present = [(equipment_classes[i], prevalence[i]) for i in range(num_equipment) if prevalence[i] > 0]
-        present.sort(key=lambda t: -t[1])
-        equipment_text = "\n".join(
-            f"- {e}: present in {p:.0%} of this phase's activities. {equipment_descriptions[e]}"
-            for e, p in present
-        )
-        activities_text = ", ".join(row["activities"])
-        phase_texts.append(
-            f"Construction phase: {phase}. Activities: {activities_text}. "
-            f"Expected equipment with prevalence: {', '.join(f'{e} ({p:.0%})' for e, p in present)}.\n"
-            f"Equipment descriptions:\n{equipment_text}"
-        )
-    phase_meta["phase_text"] = phase_texts
-
-    return phase_names, equipment_classes, phase_equipment_prevalence, phase_meta
-
-
-def _build_phase_structured(
-    phase_names: list[str], equipment_classes: list[str], phase_equipment_prevalence, phase_meta
-) -> torch.Tensor:
-    duration = phase_meta["duration_days"].to_numpy(dtype=np.float32)
-    duration = duration / max(duration.max(), 1.0)
-    criticality = phase_meta["criticality"].to_numpy(dtype=np.float32)
-
-    rows = []
-    for i, phase in enumerate(phase_names):
-        rows.append(
-            np.concatenate(
-                [phase_equipment_prevalence[phase], np.array([duration[i], criticality[i]], dtype=np.float32)]
-            )
-        )
-    return torch.tensor(np.stack(rows), dtype=torch.float32)
-
-
 log.info("building phase metadata from %s", DATA_DIR)
-PHASE_NAMES, EQUIPMENT_CLASSES, _phase_equipment, _phase_meta = _build_phase_meta()
+PHASE_NAMES, EQUIPMENT_CLASSES, _phase_equipment, _phase_meta = build_phase_meta(DATA_DIR)
 NUM_PHASES = len(PHASE_NAMES)
 NUM_EQUIPMENT = len(EQUIPMENT_CLASSES)
-
-log.info("loading checkpoint from %s", CHECKPOINT_PATH)
-_checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu")
-if _checkpoint["phase_names"] != PHASE_NAMES or _checkpoint["equipment_classes"] != EQUIPMENT_CLASSES:
-    raise RuntimeError(
-        "bundled data/*.csv does not match the phase_names/equipment_classes "
-        "the checkpoint was trained with — data/checkpoint are out of sync"
-    )
 
 log.info("encoding phase text with %s", TEXT_MODEL_NAME)
 _text_encoder = SentenceTransformer(TEXT_MODEL_NAME, device="cpu")
@@ -192,78 +112,94 @@ with torch.no_grad():
         .unsqueeze(0)
     )  # (1, NUM_PHASES, 384)
 
-PHASE_STRUCTURED = _build_phase_structured(
-    PHASE_NAMES, EQUIPMENT_CLASSES, _phase_equipment, _phase_meta
+PHASE_STRUCTURED = torch.from_numpy(
+    build_phase_structured(PHASE_NAMES, _phase_equipment, _phase_meta)
 ).unsqueeze(0)  # (1, NUM_PHASES, NUM_EQUIPMENT + 2)
 
-_config = _checkpoint["config"]
-WINDOW_SIZE = _config["window_size"]
-_model = ConstructionPhaseModel(
-    observation_dim=_config["observation_dim"],
-    phase_text_dim=_config["phase_text_dim"],
-    phase_structured_dim=_config["phase_structured_dim"],
-    max_len=WINDOW_SIZE,
-)
-_model.load_state_dict(_checkpoint["model_state_dict"])
-_model.eval()
-log.info("phase model ready (%d params)", sum(p.numel() for p in _model.parameters()))
+def _load_member(path: Path, weight: float) -> dict:
+    checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint["phase_names"] != PHASE_NAMES or checkpoint["equipment_classes"] != EQUIPMENT_CLASSES:
+        raise RuntimeError(
+            f"bundled data/*.csv does not match the phase_names/equipment_classes {path.name} "
+            "was trained with — data/checkpoint are out of sync"
+        )
+    config = checkpoint["config"]
+    model = ConstructionPhaseModel(
+        observation_dim=config["observation_dim"],
+        phase_text_dim=config["phase_text_dim"],
+        phase_structured_dim=config["phase_structured_dim"],
+        max_len=config["window_size"],
+        causal=config.get("causal", False),
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    # чекпоинты до features.py версии не хранили — это v1
+    version = config.get("feature_version", FEATURE_VERSION_LEGACY)
+    log.info("loaded %s (weight %g, features v%d, window %d)", path.name, weight, version, config["window_size"])
+    return {"name": path.name, "model": model, "weight": weight, "window": config["window_size"], "version": version}
 
 
-def _daily_observation(counts_by_class: dict[str, int]) -> np.ndarray:
-    counts = np.zeros(NUM_EQUIPMENT, dtype=np.float32)
-    for cls, n in counts_by_class.items():
-        if cls in EQUIPMENT_CLASSES:
-            counts[EQUIPMENT_CLASSES.index(cls)] = float(n)
-    count_feature = np.clip(counts, 0, 5) / 5.0
-    visible = np.ones(NUM_EQUIPMENT, dtype=np.float32)
-    confidence = np.ones(NUM_EQUIPMENT, dtype=np.float32)
-    return np.concatenate([count_feature, visible, confidence]).astype(np.float32)
+# Недостающий участник ансамбля (напр. best_base.pt не попал в деплой —
+# *.pt в .gitignore) не роняет сервис: работаем на оставшихся моделях.
+for _path, _ in CHECKPOINTS:
+    if not _path.exists():
+        log.warning("phase checkpoint %s not found — ensemble runs without it", _path)
+_members = [_load_member(path, weight) for path, weight in CHECKPOINTS if path.exists()]
+if not _members:
+    raise RuntimeError(f"no phase checkpoint found among {[str(p) for p, _ in CHECKPOINTS]}")
+_total_weight = sum(m["weight"] for m in _members)
+# первая модель — для _build_window (обратная совместимость с бенчмарком и логом)
+_model = _members[0]["model"]
+WINDOW_SIZE = _members[0]["window"]
+FEATURE_VERSION = _members[0]["version"]
+log.info("phase ensemble ready: %s", ", ".join(f"{m['name']} x{m['weight']:g}" for m in _members))
 
 
 def _build_window(history: list[DailyEquipmentCounts], as_of_date: date) -> np.ndarray:
-    """One row per calendar day for the `WINDOW_SIZE` days ending on
-    `as_of_date` — see module docstring for the forward-fill/zero-fill
-    rules. `history` is sorted here since callers (and tests) shouldn't have
-    to guarantee ordering themselves."""
-    history = sorted(history, key=lambda h: h.date)
-    window_start = as_of_date - timedelta(days=WINDOW_SIZE - 1)
+    """One row per calendar day for the first model's `WINDOW_SIZE` days
+    ending on `as_of_date` — features.build_window() builds it exactly like
+    training did for that checkpoint's feature version (see features.py)."""
+    by_day = {h.date: {c.equipment_class: c.count for c in h.counts} for h in history}
+    return build_window(by_day, as_of_date, WINDOW_SIZE, EQUIPMENT_CLASSES, FEATURE_VERSION)
 
-    rows = []
-    last_counts: dict[str, int] = {}
-    h_idx = 0
-    day = window_start
-    while day <= as_of_date:
-        while h_idx < len(history) and history[h_idx].date <= day:
-            last_counts = {c.equipment_class: c.count for c in history[h_idx].counts}
-            h_idx += 1
-        rows.append(_daily_observation(last_counts))
-        day += timedelta(days=1)
-    return np.stack(rows)  # (WINDOW_SIZE, observation_dim)
+
+@torch.no_grad()
+def predict_probs(by_day: dict[date, dict[str, int]], as_of_dates: list[date], batch_size: int = 256) -> np.ndarray:
+    """(len(as_of_dates), NUM_PHASES) — ансамбль всех моделей на последней
+    позиции окна каждого дня (как в проде). Общий для compute() и бенчмарка."""
+    log_sum = np.zeros((len(as_of_dates), NUM_PHASES))
+    for m in _members:
+        for i in range(0, len(as_of_dates), batch_size):
+            chunk = as_of_dates[i : i + batch_size]
+            obs = torch.from_numpy(
+                np.stack([build_window(by_day, d, m["window"], EQUIPMENT_CLASSES, m["version"]) for d in chunk])
+            )
+            out = m["model"](
+                observations=obs,
+                phase_text_embeddings=PHASE_TEXT_EMBEDDINGS.expand(len(chunk), -1, -1),
+                phase_structured=PHASE_STRUCTURED.expand(len(chunk), -1, -1),
+            )
+            log_sum[i : i + len(chunk)] += m["weight"] / _total_weight * torch.log_softmax(out.emissions[:, -1], -1).numpy()
+    probs = np.exp(log_sum - log_sum.max(1, keepdims=True))
+    return probs / probs.sum(1, keepdims=True)
 
 
 def compute(command: PhaseCommand) -> PhaseResult:  # EXTENSION POINT
-    window = _build_window(command.history, command.as_of_date)
-    observations = torch.from_numpy(window).unsqueeze(0)  # (1, WINDOW_SIZE, observation_dim)
-
-    latest_counts = window[-1, :NUM_EQUIPMENT] * 5.0  # undo the /5 clip-normalization for logging
-    seen = ", ".join(
-        f"{cls}: {int(round(n))}" for cls, n in zip(EQUIPMENT_CLASSES, latest_counts) if n > 0
-    ) or "none"
+    by_day = {h.date: {c.equipment_class: c.count for c in h.counts} for h in command.history}
+    latest = max((h for h in command.history if h.date <= command.as_of_date), key=lambda h: h.date, default=None)
+    seen = (
+        ", ".join(f"{c.equipment_class}: {c.count}" for c in latest.counts if c.count > 0) or "none"
+        if latest is not None
+        else "none"
+    )
     log.info(
-        "classifying phase as of %s from a %d-day window (%d days with real data) — latest day: %s",
+        "classifying phase as of %s (%d days with real data) — latest day: %s",
         command.as_of_date,
-        len(window),
         len(command.history),
         seen,
     )
 
-    with torch.no_grad():
-        output = _model(
-            observations=observations,
-            phase_text_embeddings=PHASE_TEXT_EMBEDDINGS,
-            phase_structured=PHASE_STRUCTURED,
-        )
-    probs = torch.softmax(output.emissions[0, -1], dim=-1)  # last position == as_of_date
+    probs = torch.from_numpy(predict_probs(by_day, [command.as_of_date])[0])
     idx = int(torch.argmax(probs).item())
     phase_name = PHASE_NAMES[idx]
 
@@ -288,6 +224,7 @@ def compute(command: PhaseCommand) -> PhaseResult:  # EXTENSION POINT
         phase_name=phase_name,
         confidence=float(probs[idx]),
         matched_stage_index=matched_stage_index,
+        probs={name: float(p) for name, p in zip(PHASE_NAMES, probs.tolist())},
     )
 
 

@@ -68,4 +68,9 @@ class PhaseResult(BaseModel):
     phase_name: str | None = None
     confidence: float | None = None
     matched_stage_index: int | None = None
+    # Full distribution over canonical phases (phase -> probability) — the
+    # backend fuses it with visual_phase's and the project's history
+    # (backend/phase_ensemble.py). None from older workers: then the backend
+    # falls back to phase_name/confidence alone.
+    probs: dict[str, float] | None = None
     error: str | None = None

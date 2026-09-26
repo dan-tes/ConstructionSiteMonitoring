@@ -128,6 +128,10 @@ async def client(tmp_path, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+    # analysis ждёт visual_phase с таймаутом в фоне — в тестах visual.result
+    # приходит сразу, так что ожидание не нужно; гасим, чтобы не висело.
+    for task in list(analysis._background_tasks):
+        task.cancel()
     app.dependency_overrides.clear()
     await engine.dispose()
 

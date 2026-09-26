@@ -93,6 +93,10 @@ class VisualPhaseResult(BaseModel):
     phase_name: str | None = None
     confidence: float | None = None
     cluster_id: int | None = None
+    # Distribution over the phases this classifier knows (phase ->
+    # probability); phases it can't see (e.g. Preconstruction) are absent and
+    # treated as neutral by the backend's fusion (backend/phase_ensemble.py).
+    probs: dict[str, float] | None = None
     error: str | None = None
 
 
@@ -210,6 +214,11 @@ class PhaseResult(BaseModel):
     phase_name: str | None = None
     confidence: float | None = None  # 0..1
     matched_stage_index: int | None = None
+    # Full distribution over canonical phases (phase -> probability) — the
+    # backend fuses it with visual_phase's and the project's history
+    # (backend/phase_ensemble.py). None from older workers: then the backend
+    # falls back to phase_name/confidence alone.
+    probs: dict[str, float] | None = None
     error: str | None = None
 
 

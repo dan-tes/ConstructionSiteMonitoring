@@ -14,7 +14,8 @@ live-inference input still differs from what it saw at training time —
 that's a modeling simplification, not a stub; see *Open items* for what
 would close the gap. **visual_phase** is the one exception worth flagging up
 front: it's real, wired code too (not a stub), but its classifier is
-explicitly experimental and only covers 4 of the 10 canonical phases — see
+explicitly experimental (9 of the 10 canonical phases, ~51% frame accuracy
+on held-out timelapses) — see
 the Services section and `services/visual_phase/worker.py`'s docstring
 before treating its output as equivalent to `phase`'s.
 
@@ -79,11 +80,23 @@ set itself skews toward earthwork/foundation/structural-frame scenes, so the
 8 clusters only ever land on 4 of the 10 canonical phases (Earthwork,
 Foundation, Structural Frame, External Works) — a photo from any of the
 other six phases still gets forced onto whichever of those 4 looks closest,
-because there's no "unknown" class. Treat it as a secondary, experimental
-signal shown next to the real (equipment-based) phase result, not a
-replacement for it — see `services/visual_phase/worker.py`'s docstring for
-the full reasoning and *Open items* below for what it would take to close
-the coverage gap.
+because there's no "unknown" class. **Update:** `weights/classifier.json` is
+now a linear head over the same embeddings, trained on frames of 14
+phase-labeled timelapses (`phase_determination/visual_phase_timelapse.py`):
+9 of 10 phases (no Preconstruction), 50.6% frame accuracy leave-one-video-out
+vs 24.8% for the k-means classifier on the same frames (kept as
+`classifier_kmeans.json`). Fused 50/50 with the equipment-based phase it
+lifts held-out timelapse accuracy from ~54% to ~61%, and that ensemble is
+what `JournalEntry.phase_name` now is (`backend/phase_ensemble.py`,
+`analysis._maybe_finalize_phase`: the backend waits for both `phase.result`
+and `visual_phase.result` — or `VISUAL_PHASE_WAIT_SECONDS` — before the delay forecast). **Update 2:** retrained on 60 labeled
+timelapse sites (46 more from YouTube, `phase_determination/eval_all.py`);
+`visual_phase` is now an ensemble of the DINOv2 head, a SigLIP head and
+SigLIP zero-shot, fused 0.6 visual / 0.4 equipment — 66.4% daily accuracy
+held-out by site (10 folds), vs 53.2% for the previous 14-site version on the
+46 new sites it never saw. On its own it is
+still a secondary signal, not a replacement for the equipment-based phase —
+see `services/visual_phase/worker.py`'s docstring and *Open items* below.
 
 Blocks 5/6 (GPT narrative reports) are implemented — see `backend/report.py`
 and *Design decisions* below for why they're in-process rather than a sixth
@@ -342,8 +355,10 @@ same way `analysis_status = "failed"` works today, no separate error path.
   numbers — not a pattern any real project produces) still drifts back
   toward `"MEP"`, so this is a real improvement on realistic inputs, not a
   guarantee against every synthetic edge case.
-- **visual_phase**: the 8-cluster classifier covers only 4 of the 10
-  canonical phases (see above) — closing this needs either more/better-
+- **visual_phase**: now a linear head covering 9 of 10 phases (see above);
+  still trained only on fixed-camera timelapse frames, not phone photos, and
+  fused with `phase` in the backend (see above). The original 8-cluster classifier's gap was
+  4 of 10 phases — closing that needed either more/better-
   distributed unlabeled photos across all 10 phases before reclustering
   (`phase_determination/build_visual_phase_classifier.py`), or real labels
   (steps 2-3 the pretraining notebook's own "Дальше" section sketches:

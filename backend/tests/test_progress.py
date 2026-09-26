@@ -7,7 +7,8 @@ import openpyxl
 
 import analysis
 from integrations import broker
-from integrations.schemas import Envelope, PhaseResult
+from integrations.schemas import Envelope, PhaseResult, VisualPhaseResult
+from models import JournalEntry
 from progress import PhaseObservation, estimate_phase_start
 from tests.conftest import _fake_publish
 from tests.test_media import VIDEO, _project
@@ -144,6 +145,20 @@ async def test_delay_command_carries_observed_phase_start(client, auth, monkeypa
                     payload=PhaseResult(
                         status="done", phase_name=phase_by_date[payload["as_of_date"]], confidence=0.9
                     ),
+                )
+            )
+            return
+        if routing_key == broker.VISUAL_PHASE_COMMAND:
+            # визуальный сигнал согласован с техникой: тест про дату начала
+            # фазы в delay.command, а не про их спор в ансамбле
+            entry_id = uuid.UUID(json.loads(body)["correlation_id"])
+            async with analysis.SessionLocal() as db:
+                entry_date = (await db.get(JournalEntry, entry_id)).date.isoformat()
+            await analysis.handle_visual_phase_result(
+                Envelope(
+                    correlation_id=entry_id,
+                    published_at=datetime.now(timezone.utc),
+                    payload=VisualPhaseResult(status="done", phase_name=phase_by_date[entry_date], confidence=0.7),
                 )
             )
             return

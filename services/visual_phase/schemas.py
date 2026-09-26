@@ -34,4 +34,8 @@ class VisualPhaseResult(BaseModel):
     # Which of the 8 unsupervised visual clusters matched, for debugging/
     # auditing a prediction against phase_determination/data/visual_phase_checkpoints/.
     cluster_id: int | None = None
+    # Distribution over the phases this classifier knows (phase ->
+    # probability); phases it can't see (e.g. Preconstruction) are absent and
+    # treated as neutral by the backend's fusion (backend/phase_ensemble.py).
+    probs: dict[str, float] | None = None
     error: str | None = None

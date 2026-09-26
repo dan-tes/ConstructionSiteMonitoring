@@ -65,6 +65,7 @@ from sqlalchemy.orm import selectinload
 if TYPE_CHECKING:
     from fastapi import BackgroundTasks
 
+import phase_ensemble
 import report
 from config import settings
 from database import SessionLocal
@@ -112,9 +113,9 @@ def _summarize_equipment(counts: list[EquipmentCount]) -> str:
     return f"В кадре обнаружена техника: {parts}."
 
 
-def _summarize_phase(result: PhaseResult) -> str:
-    confidence_pct = round((result.confidence or 0) * 100)
-    return f"Текущая фаза объекта: {result.phase_name} (уверенность {confidence_pct}%)."
+def _summarize_phase(phase_name: str, confidence: float | None) -> str:
+    confidence_pct = round((confidence or 0) * 100)
+    return f"Текущая фаза объекта: {phase_name} (уверенность {confidence_pct}%)."
 
 
 def _summarize_delay(stage_summary: str | None, result: DelayForecastResult) -> str:
@@ -407,6 +408,10 @@ async def run_entry_analysis(entry_id: uuid.UUID) -> None:
         if entry is None or not entry.media:
             return
         entry.analysis_status = "analyzing"
+        # новый прогон — прошлые сигналы фазы не должны попасть в ансамбль
+        entry.equipment_phase_probs = None
+        entry.visual_phase_probs = None
+        entry.visual_phase_status = "pending"
         media = list(entry.media)
         await db.commit()
 
@@ -524,28 +529,47 @@ async def _maybe_advance_entry(entry_id: uuid.UUID) -> None:
 async def handle_visual_phase_result(envelope: Envelope[VisualPhaseResult]) -> None:
     """Persists services/visual_phase's result on the journal entry it was
     computed for (`run_entry_analysis` fires exactly one visual_phase.command
-    per entry, against one representative file) — a plain observational
-    field, never marking the entry failed/ready and never touching
-    stage_summary or the delay forecast (see that service's module
-    docstring for why: its 8-cluster classifier only covers 4 of the 10
-    canonical phases, so it isn't fit to drive anything downstream yet). A
-    `failed` status or a missing phase_name here is just left unpersisted,
-    same as "no signal"."""
+    per entry, against one representative file) and hands it to the phase
+    ensemble (`_maybe_finalize_phase`): the entry's final phase_name is the
+    equipment-based phase fused with this one — see phase_ensemble.py. A
+    `failed` status just means "no visual signal": the ensemble goes ahead
+    on equipment alone, it never fails the entry.
+
+    Only a result that arrives while the ensemble is still waiting for it
+    re-triggers finalization — a late reply after the wait already timed out
+    is kept for display but doesn't recompute the phase (and re-run
+    delay/narratives) for an entry that has moved on."""
     entry_id = envelope.correlation_id
     result = envelope.payload
-    if result.status == "failed" or result.phase_name is None:
-        return
 
     async with SessionLocal() as db:
         entry = await db.get(JournalEntry, entry_id)
         if entry is None:
             return
-        entry.visual_phase_name = result.phase_name
-        entry.visual_phase_confidence = result.confidence
+        was_waiting = entry.visual_phase_status == "pending"
+        if result.status == "failed" or result.phase_name is None:
+            log.warning("visual_phase gave no signal for entry %s: %s", entry_id, result.error)
+            if was_waiting:
+                entry.visual_phase_status = "failed"
+        else:
+            entry.visual_phase_name = result.phase_name
+            entry.visual_phase_confidence = result.confidence
+            probs = result.probs or phase_ensemble.from_point_estimate(result.phase_name, result.confidence)
+            entry.visual_phase_probs = json.dumps(probs) if probs else None
+            if was_waiting:
+                entry.visual_phase_status = "done"
         await db.commit()
+
+    if was_waiting:
+        await _maybe_finalize_phase(entry_id)
 
 
 async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
+    """Keeps the equipment-based phase distribution and finalizes the
+    entry's phase as soon as visual_phase has also answered (or failed); if
+    it hasn't yet, finalization waits for it, bounded by
+    VISUAL_PHASE_WAIT_SECONDS so a down visual_phase service can't stall the
+    pipeline."""
     entry_id = envelope.correlation_id
     result = envelope.payload
     if result.status == "failed" or result.phase_name is None:
@@ -556,23 +580,83 @@ async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
         entry = await db.get(JournalEntry, entry_id)
         if entry is None:
             return
-        entry.stage_summary = _summarize_phase(result)
-        entry.phase_name = result.phase_name
-        entry.phase_confidence = result.confidence
+        probs = result.probs or phase_ensemble.from_point_estimate(result.phase_name, result.confidence)
+        entry.equipment_phase_probs = json.dumps(probs)
+        waiting = entry.visual_phase_status == "pending"
+        await db.commit()
+
+    if waiting:
+        task = asyncio.create_task(_finalize_after_wait(entry_id))
+        _background_tasks.add(task)
+        task.add_done_callback(_on_background_task_done)
+    await _maybe_finalize_phase(entry_id)
+
+
+# Сколько ждать visual_phase после того, как пришла фаза по технике.
+VISUAL_PHASE_WAIT_SECONDS = 180.0
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _on_background_task_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.error("background phase finalization failed", exc_info=task.exception())
+
+
+async def _finalize_after_wait(entry_id: uuid.UUID) -> None:
+    await asyncio.sleep(VISUAL_PHASE_WAIT_SECONDS)
+    async with SessionLocal() as db:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is None or entry.visual_phase_status != "pending":
+            return  # visual_phase answered in time — already finalized
+        log.warning("visual_phase didn't answer entry %s in %.0fs — phase from equipment alone", entry_id, VISUAL_PHASE_WAIT_SECONDS)
+        entry.visual_phase_status = "timeout"
+        await db.commit()
+    await _maybe_finalize_phase(entry_id)
+
+
+async def _maybe_finalize_phase(entry_id: uuid.UUID) -> None:
+    """The entry's final phase = phase_ensemble.fuse(equipment, visual) —
+    once the equipment result is in and visual_phase is no longer pending.
+    Then the delay forecast runs off that final phase, exactly as it used to
+    run off services/phase's raw answer. Like `_maybe_advance_entry`, not
+    locked: a duplicate call just recomputes the same phase and re-publishes
+    delay.command, which every consumer already tolerates."""
+    async with SessionLocal() as db:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is None or entry.equipment_phase_probs is None or entry.visual_phase_status == "pending":
+            return
+        equipment = json.loads(entry.equipment_phase_probs)
+        visual = (
+            json.loads(entry.visual_phase_probs)
+            if entry.visual_phase_status == "done" and entry.visual_phase_probs
+            else None
+        )
+        fused = phase_ensemble.fuse(equipment, visual)
+        phase_name, confidence = phase_ensemble.top(fused)
+        log.info(
+            "entry %s phase: %s %.0f%% (equipment %s, visual %s)",
+            entry_id,
+            phase_name,
+            confidence * 100,
+            "%s %.0f%%" % phase_ensemble.top(equipment),
+            "%s %.0f%%" % phase_ensemble.top(visual) if visual else entry.visual_phase_status,
+        )
+        entry.stage_summary = _summarize_phase(phase_name, confidence)
+        entry.phase_name = phase_name
+        entry.phase_confidence = confidence
         plan = await _load_plan(db, entry.project_id)
         planned_start = await _project_planned_start(db, entry.project_id)
         as_of_date = entry.date
         await db.flush()
-        phase_started_at = await _current_phase_started_at(
-            db, entry.project_id, result.phase_name, as_of_date
-        )
+        phase_started_at = await _current_phase_started_at(db, entry.project_id, phase_name, as_of_date)
         await db.commit()
 
     if planned_start is None:
         # No plan-stage math possible without a start anchor — same
         # "nothing to forecast from" outcome as an empty plan.
         await handle_delay_result(
-            _envelope(entry_id, DelayForecastResult(status="done", confidence=result.confidence))
+            _envelope(entry_id, DelayForecastResult(status="done", confidence=confidence))
         )
         return
 
@@ -580,9 +664,9 @@ async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
         plan_stages=plan.phases if plan else [],
         planned_start=planned_start,
         project_duration_days=plan.project_duration_days if plan else None,
-        current_phase=result.phase_name,
+        current_phase=phase_name,
         as_of_date=as_of_date,
-        phase_confidence=result.confidence if result.confidence is not None else 1.0,
+        phase_confidence=confidence,
         current_phase_started_at=phase_started_at,
     )
     body = _envelope(entry_id, command).model_dump_json().encode()
