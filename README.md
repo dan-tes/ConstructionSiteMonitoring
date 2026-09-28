@@ -44,4 +44,3 @@ scripts/dev_up.sh
 - [Архитектура](docs/architecture.md): компоненты и путь видео через конвейер анализа
 - [API](docs/api.md): авторизация, эндпоинты, хранение файлов
 - [ML-исследования](docs/ml.md): что лежит в `cv/`, `phase_determination/`, `latency_prediction/`
-- [Конвейер анализа, подробно](backend/integrations/README.md): топология RabbitMQ, контракты, принятые решения
