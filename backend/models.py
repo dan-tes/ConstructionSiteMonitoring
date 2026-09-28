@@ -128,10 +128,17 @@ class JournalEntry(Base):
     analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Visual-phase signal (services/visual_phase), computed once per entry
-    # against one representative file — observational only, does not feed
-    # the delay forecast; see analysis.py's handle_visual_phase_result.
+    # against one representative file — what the photo classifier alone
+    # said. The entry's phase_name below is services/phase's fusion of the
+    # equipment and visual signals over the project's history.
     visual_phase_name: Mapped[str | None] = mapped_column(String(30), nullable=True)
     visual_phase_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Full services/visual_phase result (JSON VisualPhaseResult): phase
+    # probabilities that analysis._load_visual_history sends to
+    # services/phase, evidence for the expert-facing report. Also the marker
+    # that the visual result has arrived — {"status": "done" | "failed" |
+    # "timeout", ...}; None while analysis._maybe_advance_entry still waits.
+    visual_phase_details: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # The same phase/delay numbers `stage_summary` already renders into one
     # text blob, kept as their own columns too — see report.py/analysis.py's

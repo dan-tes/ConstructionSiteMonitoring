@@ -4,3 +4,18 @@ phase_determination/data/
 phase_determination/visual_pretraining_checkpoints/
 *.pt
 services/phase/weights/best.pt
+data/
+
+# --- данные и крупные артефакты (не в git) ---
+*.mp4
+*.npz
+*.npy
+cv/runs/
+latency_prediction/data/
+phase_determination/visual_pretraining_embeddings/
+# timelapse-оценка: сгенерированные кадры/детекции; разметка и summary.md остаются
+phase_determination/timelapse_eval*/**/previews/
+phase_determination/timelapse_eval*/**/frames/
+phase_determination/timelapse_eval*/**/contact*/*.jpg
+phase_determination/timelapse_eval*/**/detections.csv
+phase_determination/timelapse_eval*/**/predictions.csv

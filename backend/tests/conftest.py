@@ -128,6 +128,10 @@ async def client(tmp_path, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+    # run_entry_analysis заводит фоновый таймер ожидания visual_phase — в
+    # тестах visual.result приходит сразу, так что он не нужен; гасим.
+    for task in list(analysis._background_tasks):
+        task.cancel()
     app.dependency_overrides.clear()
     await engine.dispose()
 

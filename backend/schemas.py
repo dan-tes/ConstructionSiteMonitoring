@@ -85,13 +85,13 @@ class VideoInsightOut(CamelModel):
     # equipment_summary above are still the load-bearing fields.
     narrative_report: str | None = None
     photos: list[ProjectFileOut] = []
-    # Experimental, observational-only signal from services/visual_phase,
-    # computed once per entry against one representative file — arrives
-    # independently of `status` (see analysis.py's
-    # handle_visual_phase_result), so this can be set even while `status` is
-    # still "analyzing", or stay unset once "ready" if that service hasn't
-    # replied yet. Covers only 4 of the 10 canonical phases — see that
-    # service's module docstring.
+    # What services/visual_phase alone said about the entry's representative
+    # file (the entry's phase in stage_summary is services/phase's fusion of
+    # this signal and the equipment model over the project's history). Arrives
+    # independently of `status` (see analysis.py's handle_visual_phase_result),
+    # so this can be set while `status` is still "analyzing", or stay unset
+    # once "ready" if that service failed or didn't reply within
+    # analysis.VISUAL_PHASE_TIMEOUT_S.
     visual_phase_name: str | None = None
     visual_phase_confidence: float | None = None
 

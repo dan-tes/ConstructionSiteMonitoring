@@ -92,8 +92,17 @@ class TemporalTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, padding_mask=None):
-        return self.norm(self.encoder(x, src_key_padding_mask=padding_mask))
+    def forward(self, x, padding_mask=None, causal=False):
+        # causal=True: позиция t видит только 0..t. Так обучение совпадает с
+        # продом, где предсказание берётся с последней позиции окна и будущего
+        # у неё нет (без маски при обучении средние позиции окна видели
+        # «завтра» и учились на информации, которой в проде не бывает).
+        mask = None
+        if causal:
+            mask = nn.Transformer.generate_square_subsequent_mask(x.size(1), device=x.device, dtype=x.dtype)
+        return self.norm(
+            self.encoder(x, mask=mask, src_key_padding_mask=padding_mask, is_causal=causal)
+        )
 
 
 class PhaseScorer(nn.Module):
@@ -121,8 +130,10 @@ class ConstructionPhaseModel(nn.Module):
         dim_feedforward=1024,
         dropout=0.1,
         max_len=4096,
+        causal=False,
     ):
         super().__init__()
+        self.causal = causal
         self.observation_encoder = ObservationEncoder(observation_dim, d_model, dropout)
         self.phase_encoder = SemanticPhaseEncoder(
             phase_text_dim, phase_structured_dim, d_model, dropout
@@ -136,7 +147,7 @@ class ConstructionPhaseModel(nn.Module):
     def forward(self, observations, phase_text_embeddings, phase_structured, padding_mask=None):
         x = self.observation_encoder(observations)
         x = self.position_encoding(x)
-        temporal = self.temporal_transformer(x, padding_mask)
+        temporal = self.temporal_transformer(x, padding_mask, causal=self.causal)
         phases = self.phase_encoder(phase_text_embeddings, phase_structured)
         emissions = self.phase_scorer(temporal, phases)
         return PhaseModelOutput(
