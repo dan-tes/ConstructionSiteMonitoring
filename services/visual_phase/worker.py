@@ -26,10 +26,10 @@ Finishing, Preconstruction, Site Preparation or Commissioning will still be
 forced onto whichever of those 4 is visually closest — there is no
 "unknown" class, because a photo is *always* nearest to *some* centroid.
 This is why `backend/analysis.py` originally treated this service's result
-as an observational field only. With the linear head (see UPDATE below) it
-is fused with `services/phase`'s distribution into the entry's final phase
-— see backend/phase_ensemble.py; `probs` in the result carries the full
-distribution for that.
+as an observational field only. With the heads below, `phase_probs` in the
+result is sent by the backend (for every entry of the project) to
+`services/phase`, which fuses it with the equipment model over the
+project's history — see services/phase/fusion.py.
 
 `confidence` here is a softmax over negative distances to all 8 centroids
 (not a trained probability) — a relative "how much closer is the nearest
@@ -55,6 +55,11 @@ against text descriptions of all 10 phases. Held-out (10-fold by site,
 phase_determination/eval_all.py) this ensemble fused with services/phase
 reaches ~66% daily accuracy vs 60.6% with the DINOv2 head alone. The
 previous single head is kept as `classifier_linear14.json`.
+
+Video: `N_VIDEO_FRAMES` (default 6) frames spread evenly over the clip, each
+classified and the probabilities averaged — one middle frame was often a
+blurry or unrepresentative view. `method_phases` in the result is what each
+ensemble member alone said (on the averaged distribution), for auditing.
 """
 
 from __future__ import annotations
@@ -73,7 +78,7 @@ import requests
 from PIL import Image
 
 from model import VisualPhaseModel
-from schemas import Envelope, VisualPhaseCommand, VisualPhaseResult
+from schemas import Envelope, PhaseScore, VisualPhaseCommand, VisualPhaseResult
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("csm.visual_phase")
@@ -87,10 +92,12 @@ COMMAND_QUEUE = "visual_phase.command.q"
 WEIGHTS_DIR = Path(__file__).parent / "weights"
 CHECKPOINT_PATH = WEIGHTS_DIR / "backbone_best.pt"
 CLASSIFIER_PATH = WEIGHTS_DIR / "classifier.json"
+N_VIDEO_FRAMES = int(os.environ.get("N_VIDEO_FRAMES", "6"))
 
 log.info("loading classifier from %s", CLASSIFIER_PATH)
 _classifier = json.loads(CLASSIFIER_PATH.read_text(encoding="utf-8"))
 _KIND = _classifier.get("type", "kmeans")  # kmeans | linear | ensemble
+MODEL_VERSION = _classifier.get("version") or _KIND
 
 log.info("loading backbone from %s", CHECKPOINT_PATH)
 _model = VisualPhaseModel(CHECKPOINT_PATH)
@@ -133,8 +140,13 @@ if _KIND == "ensemble":
         (m["backbone"], m["weight"], _linear(m["head"]) if "head" in m else _zero_shot(m["zero_shot"]))
         for m in _classifier["members"]
     ]
+    # имена для method_phases: dino_head, siglip_head, siglip_zero_shot
+    _member_names = [
+        f"{m['backbone']}_{'head' if 'head' in m else 'zero_shot'}" for m in _classifier["members"]
+    ]
 elif _KIND == "linear":
     _members = [("dino", 1.0, _linear(_classifier))]
+    _member_names = ["dino_head"]
 else:
     _scaler_mean = np.array(_classifier["scaler_mean"], dtype=np.float32)
     _scaler_scale = np.array(_classifier["scaler_scale"], dtype=np.float32)
@@ -150,7 +162,7 @@ log.info(
 
 def _fuse(dists: list[tuple[float, dict[str, float]]]) -> dict[str, float]:
     """Log-линейное объединение участников. Фаза, которую участник не знает,
-    для него нейтральна (среднее по известным) — как в backend/phase_ensemble.py."""
+    для него нейтральна (среднее по известным), а не запрещена."""
     phases = sorted({p for _, d in dists for p in d})
     log_sum = np.zeros(len(phases))
     total = sum(w for w, _ in dists)
@@ -173,72 +185,106 @@ def _download(media_url: str, *, suffix: str) -> Path:
     return path
 
 
-def _middle_frame(video_path: Path) -> Image.Image:
-    """One representative frame from the middle of the clip — a construction
-    phase doesn't change within a single short video (same assumption
-    services/vision's docstring makes), so there's nothing to gain from
-    sampling more than one frame."""
+def _video_frames(video_path: Path, n: int) -> list[Image.Image]:
+    """`n` frames spread evenly over the clip (centres of n equal segments,
+    so neither the very first nor the very last frame, which are often a
+    camera being raised or lowered). Unreadable positions are skipped; at
+    least one frame must be read."""
     import cv2
 
     cap = cv2.VideoCapture(str(video_path))
     try:
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 2)
-        ok, frame_bgr = cap.read()
-        if not ok:
+        n = max(1, min(n, frame_count))
+        frames = []
+        for k in range(n):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int((k + 0.5) * frame_count / n))
+            ok, frame_bgr = cap.read()
+            if ok:
+                frames.append(Image.fromarray(frame_bgr[:, :, ::-1]))
+        if not frames:
             raise ValueError(f"could not read a frame from {video_path}")
-        return Image.fromarray(frame_bgr[:, :, ::-1])
+        return frames
     finally:
         cap.release()
+
+
+def _classify_members(image: Image.Image) -> list[tuple[str, float, dict[str, float]]]:
+    """(member name, weight, {phase: probability}) for one image."""
+    embeddings = {"dino": _model.embed(image).numpy()}
+    if _siglip is not None:
+        embeddings["siglip"] = _siglip(image)
+    return [(name, w, head(embeddings[backbone])) for name, (backbone, w, head) in zip(_member_names, _members)]
+
+
+def _classify_kmeans(image: Image.Image) -> tuple[dict[str, float], int]:
+    standardized = (_model.embed(image).numpy() - _scaler_mean) / _scaler_scale
+    dists = np.linalg.norm(_centroids - standardized, axis=1)
+    # Softmax over negative distances: a relative confidence among the 8
+    # clusters, not a calibrated probability - see module docstring.
+    weights = np.exp(-dists - (-dists).max())
+    probs = weights / weights.sum()
+    # кластеры одной фазы складываются — нужен вектор по фазам
+    by_phase = {
+        phase: float(sum(p for c, p in enumerate(probs) if _cluster_phase[c] == phase))
+        for phase in sorted(set(_cluster_phase.values()))
+    }
+    return by_phase, int(np.argmin(dists))
+
+
+def _mean(dists: list[dict[str, float]]) -> dict[str, float]:
+    phases = sorted({p for d in dists for p in d})
+    return {p: float(np.mean([d.get(p, 0.0) for d in dists])) for p in phases}
 
 
 def compute(command: VisualPhaseCommand) -> VisualPhaseResult:  # EXTENSION POINT
     log.info("classifying visual phase for asset %s (%s, %s)", command.asset_id, command.kind, command.media_url)
     media_path = _download(command.media_url, suffix=".mp4" if command.kind == "video" else ".jpg")
     try:
-        image = _middle_frame(media_path) if command.kind == "video" else Image.open(media_path)
-        image.load()
-        dino_embedding = _model.embed(image).numpy()
+        if command.kind == "video":
+            images = _video_frames(media_path, N_VIDEO_FRAMES)
+        else:
+            images = [Image.open(media_path)]
+            images[0].load()
     finally:
         media_path.unlink(missing_ok=True)
 
+    cluster_id = None
+    method_phases = None
     if _members:
-        embeddings = {"dino": dino_embedding}
-        if _siglip is not None:
-            embeddings["siglip"] = _siglip(image)
-        probs = _fuse([(w, head(embeddings[backbone])) for backbone, w, head in _members])
-        phase_name = max(probs, key=probs.__getitem__)
-        log.info("asset %s -> %s, confidence %.0f%%", command.asset_id, phase_name, probs[phase_name] * 100)
-        return VisualPhaseResult(
-            status="done", phase_name=phase_name, confidence=probs[phase_name], cluster_id=None, probs=probs
-        )
+        per_frame = [_classify_members(image) for image in images]
+        names = [name for name, _, _ in per_frame[0]]
+        # среднее по кадрам — отдельно для каждого участника, затем объединение
+        member_probs = [
+            (w, _mean([frame[i][2] for frame in per_frame])) for i, (_, w, _) in enumerate(per_frame[0])
+        ]
+        probs = _fuse(member_probs)
+        method_phases = {name: max(d, key=d.__getitem__) for name, (_, d) in zip(names, member_probs)}
+    else:
+        readings = [_classify_kmeans(image) for image in images]
+        probs = _mean([r[0] for r in readings])
+        cluster_id = readings[len(readings) // 2][1]
 
-    standardized = (dino_embedding - _scaler_mean) / _scaler_scale
-    dists = np.linalg.norm(_centroids - standardized, axis=1)
-    # Softmax over negative distances: a relative confidence among the 8
-    # clusters, not a calibrated probability - see module docstring.
-    weights = np.exp(-dists - (-dists).max())
-    probs = weights / weights.sum()
-    cluster_id = int(np.argmin(dists))
-    phase_name = _cluster_phase[cluster_id]
-
+    phase_name = max(probs, key=probs.__getitem__)
+    top = sorted(probs.items(), key=lambda kv: -kv[1])[:3]
     log.info(
-        "asset %s -> cluster %d (%s), confidence %.0f%%",
+        "asset %s -> %s, confidence %.0f%% (%d frame(s)); members: %s",
         command.asset_id,
-        cluster_id,
         phase_name,
-        float(probs[cluster_id]) * 100,
+        probs[phase_name] * 100,
+        len(images),
+        method_phases or f"k-means cluster {cluster_id}",
     )
     return VisualPhaseResult(
         status="done",
         phase_name=phase_name,
-        confidence=float(probs[cluster_id]),
+        confidence=probs[phase_name],
+        phase_probs={p: round(v, 4) for p, v in probs.items()},
+        top_phases=[PhaseScore(phase=p, prob=round(v, 4)) for p, v in top],
+        method_phases=method_phases,
+        frames_used=len(images),
+        model_version=MODEL_VERSION,
         cluster_id=cluster_id,
-        # кластеры одной фазы складываются — бэкенду нужен вектор по фазам
-        probs={
-            phase: float(sum(p for c, p in enumerate(probs) if _cluster_phase[c] == phase))
-            for phase in sorted(set(_cluster_phase.values()))
-        },
     )
 
 

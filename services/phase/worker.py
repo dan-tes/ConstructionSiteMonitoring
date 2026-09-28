@@ -1,5 +1,20 @@
 """Phase service — current project phase (диаграмма: блок 3).
 
+Two signals fused over the project's history (see fusion.py):
+  * equipment: the ConstructionPhaseModel ensemble below, evaluated on EVERY
+    day of the window the site was actually filmed (each day as the last
+    position of its own window, like in training), not only on as_of_date;
+  * visual: services/visual_phase's phase probabilities of the project's
+    journal entries (`command.visual_history`, collected by the backend).
+Both go through a hidden Markov chain over the canonical phase order (order
+and durations from the plan, never its dates). The result is P(phase | all
+observations up to as_of_date); it is NOT advanced past the last
+observation — `days_since_last_observation` says how stale it is. Without
+visual_history the service works as before, just smoothed over history.
+Signal weights: PHASE_WEIGHT_EQUIPMENT / PHASE_WEIGHT_VISUAL /
+PHASE_WEIGHT_FILLED (env). Defaults (0.5 / 1.0 / 0) are a cautious
+assumption, not fitted — see fusion.FusionWeights.
+
 Consumes `phase.command` from the shared `csm.analysis` exchange, computes a
 result, publishes it on `phase.result`. See backend/integrations/README.md
 for the pipeline topology this is one leg of.
@@ -55,7 +70,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import aio_pika
@@ -63,9 +78,10 @@ import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 
-from features import FEATURE_VERSION_LEGACY, build_phase_meta, build_phase_structured, build_window
+from features import FEATURE_VERSION_LEGACY, build_phase_meta, build_phase_structured, build_window, dense_history
+from fusion import FusionWeights, fuse
 from model import ConstructionPhaseModel
-from schemas import DailyEquipmentCounts, Envelope, PhaseCommand, PhaseResult
+from schemas import DailyEquipmentCounts, DailyVisualPhase, Envelope, PhaseCommand, PhaseResult, PhaseScore
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("csm.phase")
@@ -94,6 +110,12 @@ else:
         for spec in os.environ.get("PHASE_CHECKPOINTS", "best.pt=3,best_base.pt=1").split(",")
     ]
 TEXT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+FUSION_WEIGHTS = FusionWeights(
+    equipment=float(os.environ.get("PHASE_WEIGHT_EQUIPMENT", "0.5")),
+    visual=float(os.environ.get("PHASE_WEIGHT_VISUAL", "1.0")),
+    filled=float(os.environ.get("PHASE_WEIGHT_FILLED", "0.0")),
+)
 
 
 log.info("building phase metadata from %s", DATA_DIR)
@@ -184,6 +206,61 @@ def predict_probs(by_day: dict[date, dict[str, int]], as_of_dates: list[date], b
     return probs / probs.sum(1, keepdims=True)
 
 
+_PHASE_INDEX = {p.lower(): i for i, p in enumerate(PHASE_NAMES)}
+
+
+def _day_kinds(by_day: dict[date, dict[str, int]], as_of_date: date) -> np.ndarray:
+    """(WINDOW_SIZE,) per calendar day of the window: "real" (that day has its
+    own observation), "filled" (forward-filled from an earlier day) or
+    "none" (before the project's first observation) — same rules as the
+    model's own window, see features.dense_history."""
+    _, observed, elapsed = dense_history(by_day, as_of_date, WINDOW_SIZE, EQUIPMENT_CLASSES)
+    return np.where(observed > 0, "real", np.where(elapsed >= 0, "filled", "none")).astype(object)
+
+
+def _build_visual_matrix(visual_history: list[DailyVisualPhase], as_of_date: date) -> np.ndarray:
+    """(WINDOW_SIZE, NUM_PHASES) visual phase probabilities aligned to the
+    same calendar days as the equipment window; NaN rows = no visual
+    reading that day. Several readings on one day are averaged. Phase names
+    are matched case-insensitively; unknown names are ignored."""
+    window_start = as_of_date - timedelta(days=WINDOW_SIZE - 1)
+    sums = np.zeros((WINDOW_SIZE, NUM_PHASES))
+    counts = np.zeros(WINDOW_SIZE)
+    for v in visual_history:
+        t = (v.date - window_start).days
+        if not 0 <= t < WINDOW_SIZE:
+            continue
+        row = np.zeros(NUM_PHASES)
+        for name, p in v.phase_probs.items():
+            i = _PHASE_INDEX.get(name.strip().lower())
+            if i is not None:
+                row[i] = max(float(p), 0.0)
+        if row.sum() <= 0:
+            continue
+        sums[t] += row / row.sum()
+        counts[t] += 1
+    out = np.full((WINDOW_SIZE, NUM_PHASES), np.nan)
+    has = counts > 0
+    out[has] = sums[has] / counts[has, None]
+    return out
+
+
+def _equipment_logprobs(by_day: dict[date, dict[str, int]], as_of_date: date, day_kind: np.ndarray) -> np.ndarray:
+    """(WINDOW_SIZE, NUM_PHASES) log-probabilities of the equipment ensemble
+    for each day of the window. Only days fusion actually weighs are run
+    through the models (real days, filled ones if PHASE_WEIGHT_FILLED > 0,
+    and as_of_date itself — fusion's fallback when nothing else is there);
+    the rest stay uniform, fusion gives them weight 0 anyway."""
+    window_start = as_of_date - timedelta(days=WINDOW_SIZE - 1)
+    needed = (day_kind == "real") | ((day_kind == "filled") & (FUSION_WEIGHTS.filled > 0))
+    needed[-1] = True
+    idx = np.where(needed)[0]
+    out = np.full((WINDOW_SIZE, NUM_PHASES), -np.log(NUM_PHASES))
+    probs = predict_probs(by_day, [window_start + timedelta(days=int(t)) for t in idx])
+    out[idx] = np.log(np.maximum(probs, 1e-12))
+    return out
+
+
 def compute(command: PhaseCommand) -> PhaseResult:  # EXTENSION POINT
     by_day = {h.date: {c.equipment_class: c.count for c in h.counts} for h in command.history}
     latest = max((h for h in command.history if h.date <= command.as_of_date), key=lambda h: h.date, default=None)
@@ -192,39 +269,55 @@ def compute(command: PhaseCommand) -> PhaseResult:  # EXTENSION POINT
         if latest is not None
         else "none"
     )
+    day_kind = _day_kinds(by_day, command.as_of_date)
+    visual = _build_visual_matrix(command.visual_history, command.as_of_date)
     log.info(
-        "classifying phase as of %s (%d days with real data) — latest day: %s",
+        "classifying phase as of %s from a %d-day window (%d days with equipment data, %d with visual) — latest day: %s",
         command.as_of_date,
-        len(command.history),
+        WINDOW_SIZE,
+        int((day_kind == "real").sum()),
+        int((~np.isnan(visual).any(axis=1)).sum()),
         seen,
     )
 
-    probs = torch.from_numpy(predict_probs(by_day, [command.as_of_date])[0])
-    idx = int(torch.argmax(probs).item())
-    phase_name = PHASE_NAMES[idx]
-
-    top3 = torch.topk(probs, min(3, NUM_PHASES))
-    ranked = ", ".join(
-        f"{PHASE_NAMES[i]} {p:.0%}" for p, i in zip(top3.values.tolist(), top3.indices.tolist())
+    fused = fuse(
+        PHASE_NAMES,
+        _equipment_logprobs(by_day, command.as_of_date, day_kind),
+        day_kind,
+        visual,
+        [(s.phase, s.planned_duration_days) for s in command.plan_stages],
+        FUSION_WEIGHTS,
     )
+    phase_name = fused["phase"]
     matched_stage_index = next(
         (i for i, s in enumerate(command.plan_stages) if s.phase.strip().lower() == phase_name.lower()),
         None,
     )
     log.info(
-        "found phase %r (confidence %.0f%%) — top-3: %s; matched plan stage index: %s",
+        "found phase %r (confidence %.0f%%) — top-3: %s; equipment says %s, visual says %s; "
+        "%d observations, last one %d days ago; matched plan stage index: %s",
         phase_name,
-        float(probs[idx]) * 100,
-        ranked,
+        fused["confidence"] * 100,
+        ", ".join(f"{t['phase']} {t['prob']:.0%}" for t in fused["top_phases"]),
+        fused["equipment_phase"],
+        fused["visual_phase"],
+        fused["observations_used"],
+        fused["days_since_last_observation"],
         matched_stage_index,
     )
 
     return PhaseResult(
         status="done",
         phase_name=phase_name,
-        confidence=float(probs[idx]),
+        confidence=fused["confidence"],
         matched_stage_index=matched_stage_index,
-        probs={name: float(p) for name, p in zip(PHASE_NAMES, probs.tolist())},
+        phase_probs=fused["phase_probs"],
+        top_phases=[PhaseScore(**t) for t in fused["top_phases"]],
+        equipment_phase=fused["equipment_phase"],
+        visual_phase=fused["visual_phase"],
+        equipment_days=fused["equipment_days"],
+        visual_days=fused["visual_days"],
+        days_since_last_observation=fused["days_since_last_observation"],
     )
 
 

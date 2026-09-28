@@ -27,15 +27,31 @@ class VisualPhaseCommand(BaseModel):
     kind: Literal["video", "image"]
 
 
+class PhaseScore(BaseModel):
+    phase: str
+    prob: float
+
+
+class EvidenceItem(BaseModel):
+    concept: str
+    label: str
+    activation: float
+    weight: float
+
+
 class VisualPhaseResult(BaseModel):
     status: Literal["done", "failed"]
     phase_name: str | None = None
     confidence: float | None = None
-    # Which of the 8 unsupervised visual clusters matched, for debugging/
-    # auditing a prediction against phase_determination/data/visual_phase_checkpoints/.
-    cluster_id: int | None = None
     # Distribution over the phases this classifier knows (phase ->
-    # probability); phases it can't see (e.g. Preconstruction) are absent and
-    # treated as neutral by the backend's fusion (backend/phase_ensemble.py).
-    probs: dict[str, float] | None = None
+    # probability) — services/phase fuses it over the project's history.
+    phase_probs: dict[str, float] | None = None
+    top_phases: list[PhaseScore] | None = None
+    # Concepts behind the answer — only a concept-based classifier fills it;
+    # None from this one (see worker.py).
+    evidence: list[EvidenceItem] | None = None
+    method_phases: dict[str, str] | None = None  # what each ensemble member alone said
+    frames_used: int | None = None
+    model_version: str | None = None
+    cluster_id: int | None = None  # k-means classifier only
     error: str | None = None

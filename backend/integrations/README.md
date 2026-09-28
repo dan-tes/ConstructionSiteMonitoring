@@ -29,7 +29,7 @@ Five services sit behind the backend, which is the pipeline's orchestrator
 | **planner** | 1 — план объекта (LLM fallback) | Given a free-form uploaded plan the canonical parser rejected, classifies it activity-by-activity onto a 43-item closed vocabulary (`services/planner/data/canonical_plan.xlsx`) via `plan_normalizer.py`, then aggregates onto the 10 canonical phases |
 | **vision** | 2 — детекция и подсчёт | Runs YOLO over an uploaded video/photo, counts equipment on site by class |
 | **visual_phase** | extra, alongside 3 | Reads the construction phase directly off a photo/video frame via an unsupervised visual classifier — no equipment detection involved. Runs in parallel with vision/phase/delay, not as a step in that chain; see below |
-| **phase** | 3 — понять фазу проекта | Given the plan schedule + equipment counts, decides the current construction phase |
+| **phase** | 3 — понять фазу проекта | Given the plan schedule + equipment counts + the project's visual-phase readings, decides the current construction phase — fuses both signals over the project's history (`services/phase/fusion.py`) |
 | **delay** | 4 — прогноз отставания | Given the plan schedule + current phase + today's date, forecasts schedule lag |
 
 Block 1 (uploaded plan → `plan_stages`) has two paths, both landing in the
@@ -87,16 +87,23 @@ phase-labeled timelapses (`phase_determination/visual_phase_timelapse.py`):
 vs 24.8% for the k-means classifier on the same frames (kept as
 `classifier_kmeans.json`). Fused 50/50 with the equipment-based phase it
 lifts held-out timelapse accuracy from ~54% to ~61%, and that ensemble is
-what `JournalEntry.phase_name` now is (`backend/phase_ensemble.py`,
-`analysis._maybe_finalize_phase`: the backend waits for both `phase.result`
-and `visual_phase.result` — or `VISUAL_PHASE_WAIT_SECONDS` — before the delay forecast). **Update 2:** retrained on 60 labeled
+what feeds the entry's phase now. **Update 2:** retrained on 60 labeled
 timelapse sites (46 more from YouTube, `phase_determination/eval_all.py`);
 `visual_phase` is now an ensemble of the DINOv2 head, a SigLIP head and
-SigLIP zero-shot, fused 0.6 visual / 0.4 equipment — 66.4% daily accuracy
-held-out by site (10 folds), vs 53.2% for the previous 14-site version on the
-46 new sites it never saw. On its own it is
-still a secondary signal, not a replacement for the equipment-based phase —
-see `services/visual_phase/worker.py`'s docstring and *Open items* below.
+SigLIP zero-shot — 66.4% daily accuracy held-out by site (10 folds) fused
+with the equipment phase, vs 53.2% for the previous 14-site version on the
+46 new sites it never saw. **Update 3 — fusion moved into `phase`:** the
+full visual result is persisted (`JournalEntry.visual_phase_details`,
+JSON), and `_maybe_advance_entry` fires `phase.command` only once every
+file's `vision.result` AND the entry's `visual_phase.result` are in (or
+the latter timed out after `analysis.VISUAL_PHASE_TIMEOUT_S`, 600 s — a down
+visual service delays an entry but never blocks it). `phase.command`
+carries `visual_history`: the `phase_probs` of every entry of the project in
+the equipment-history window. `services/phase` fuses them with its
+equipment model over the whole history (hidden Markov chain over the phase
+order, `services/phase/fusion.py`) and its answer IS the entry's phase —
+the backend-side per-entry ensemble (`phase_ensemble.py`) is gone. Video
+is classified on `N_VIDEO_FRAMES` (6) frames averaged, not one middle frame.
 
 Blocks 5/6 (GPT narrative reports) are implemented — see `backend/report.py`
 and *Design decisions* below for why they're in-process rather than a sixth
@@ -158,9 +165,9 @@ every file in the entry has reported in, `_maybe_advance_entry()` publishes
 the entry's ONE `phase.command` off the combined counts → on `phase.result`
 persist the phase and publish the entry's ONE `delay.command` → on
 `delay.result` persist the forecast, mark the entry `ready`, and move on to
-GPT summaries (blocks 5/6, TBD). `visual_phase.result` is consumed
-independently and just persists its two fields, on its own schedule,
-whenever it arrives. Each stage transition happens in the backend's result
+GPT summaries (blocks 5/6). `visual_phase.result` is persisted whenever it
+arrives, and `phase.command` waits for it (or its timeout) — see
+*Update 3* above. Each stage transition happens in the backend's result
 consumer, keyed by `correlation_id` — the entry's id for
 visual_phase/phase/delay, but the individual file's id for vision (see the
 `correlation_id` design-decision bullet below).
@@ -272,7 +279,9 @@ same way `analysis_status = "failed"` works today, no separate error path.
   Services section above and `services/visual_phase/worker.py`'s docstring.
   If its classifier ever gets real coverage of all 10 phases, promoting it
   into (or blending it with) the equipment-based `phase` step is the
-  natural next move; today it's deliberately a sidecar, not a dependency.
+  natural next move. **Done** (see *Update 3* above): it is still a
+  parallel leg on the wire, but `phase.command` now waits for it and
+  `services/phase` fuses it in.
 - **Blocks 5/6 (`backend/report.py`) are an in-process call, not a sixth
   broker leg.** Nothing outside `analysis.py` ever invokes them, so there's
   no second service to keep consistent with the broker pattern (see
@@ -357,7 +366,7 @@ same way `analysis_status = "failed"` works today, no separate error path.
   guarantee against every synthetic edge case.
 - **visual_phase**: now a linear head covering 9 of 10 phases (see above);
   still trained only on fixed-camera timelapse frames, not phone photos, and
-  fused with `phase` in the backend (see above). The original 8-cluster classifier's gap was
+  fused into `phase` over the project's history (see above). The original 8-cluster classifier's gap was
   4 of 10 phases — closing that needed either more/better-
   distributed unlabeled photos across all 10 phases before reclustering
   (`phase_determination/build_visual_phase_classifier.py`), or real labels
@@ -373,12 +382,16 @@ same way `analysis_status = "failed"` works today, no separate error path.
   `docker compose build visual_phase` will produce a working image.
   `weights/classifier.json` (the cluster centroids + phase labels, small) is
   committed normally.
-- **visual_phase**: no history kept — each new result overwrites
-  `JournalEntry.visual_phase_name`/`visual_phase_confidence` for that entry,
-  there's no per-project trend the way `EquipmentObservation` gives the
-  equipment-based phase model. Not needed for a one-photo-per-entry signal
-  today, but worth knowing before building anything that expects a time
-  series out of it.
+- **resolved** — **visual_phase**: no history kept. Each entry's full
+  result is now in `JournalEntry.visual_phase_details`, and the project's
+  series of them is `PhaseCommand.visual_history`.
+- **phase fusion weights** (`PHASE_WEIGHT_EQUIPMENT` 0.5 /
+  `PHASE_WEIGHT_VISUAL` 1.0 / `PHASE_WEIGHT_FILLED` 0, env of
+  `services/phase`) are a cautious assumption, not fitted: the fusion has
+  only been checked on synthetic scenarios (`services/phase/test_fusion.py`),
+  not on a real project with a series of entries and known phases.
+- **visual_phase gets one file per entry** — sending every file and
+  averaging is the obvious next step.
 - **resolved** — **delay**: `current_phase_started_at` used to be
   simplified to `planned_start +` the matched phase's offset (assumes the
   phase started on time), which zeroed the forecast every time a new phase

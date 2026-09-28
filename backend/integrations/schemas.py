@@ -88,15 +88,37 @@ class VisualPhaseCommand(BaseModel):
     kind: Literal["video", "image"]
 
 
+class PhaseScore(BaseModel):
+    phase: str
+    prob: float
+
+
+class EvidenceItem(BaseModel):
+    """One concept behind a visual-phase answer (e.g. "арматура на уровне
+    земли/дна") and how much it pushed toward the chosen phase — for the
+    expert-facing report, not used by the pipeline itself."""
+    concept: str
+    label: str
+    activation: float
+    weight: float
+
+
 class VisualPhaseResult(BaseModel):
     status: Literal["done", "failed"]
     phase_name: str | None = None
     confidence: float | None = None
-    cluster_id: int | None = None
-    # Distribution over the phases this classifier knows (phase ->
-    # probability); phases it can't see (e.g. Preconstruction) are absent and
-    # treated as neutral by the backend's fusion (backend/phase_ensemble.py).
-    probs: dict[str, float] | None = None
+    # v2 — all optional, so the backend and the service can be rolled out in
+    # any order. `phase_probs` is what services/phase fuses over the
+    # project's history (see analysis._load_visual_history); the rest is
+    # kept in JournalEntry.visual_phase_details for display/reports.
+    phase_probs: dict[str, float] | None = None
+    top_phases: list[PhaseScore] | None = None
+    # Empty = the answer had no concept support (lower trust).
+    evidence: list[EvidenceItem] | None = None
+    method_phases: dict[str, str] | None = None  # what each ensemble member alone said
+    frames_used: int | None = None  # video: frames averaged; image: 1
+    model_version: str | None = None
+    cluster_id: int | None = None  # deprecated (k-means classifier), always None
     error: str | None = None
 
 
@@ -203,10 +225,22 @@ class DailyEquipmentCounts(BaseModel):
     counts: list[EquipmentCount]
 
 
+class DailyVisualPhase(BaseModel):
+    """One journal entry's visual-phase reading (VisualPhaseResult.phase_probs)
+    on the entry's date. Several entries on one date are sent separately
+    and averaged by services/phase."""
+    date: date
+    phase_probs: dict[str, float]
+
+
 class PhaseCommand(BaseModel):
     plan_stages: list[PlanPhaseIn]
     history: list[DailyEquipmentCounts]  # chronological, sparse — see above
     as_of_date: date  # which day to predict the phase "as of" (the latest entry's date)
+    # Visual readings of the project's entries over the same look-back as
+    # `history` — services/phase fuses both signals over the whole history
+    # (services/phase/fusion.py). Optional: an older phase service ignores it.
+    visual_history: list[DailyVisualPhase] = []
 
 
 class PhaseResult(BaseModel):
@@ -214,11 +248,17 @@ class PhaseResult(BaseModel):
     phase_name: str | None = None
     confidence: float | None = None  # 0..1
     matched_stage_index: int | None = None
-    # Full distribution over canonical phases (phase -> probability) — the
-    # backend fuses it with visual_phase's and the project's history
-    # (backend/phase_ensemble.py). None from older workers: then the backend
-    # falls back to phase_name/confidence alone.
-    probs: dict[str, float] | None = None
+    # v2 — all optional (older workers don't send them):
+    phase_probs: dict[str, float] | None = None  # fused posterior over canonical phases
+    top_phases: list[PhaseScore] | None = None
+    equipment_phase: str | None = None  # the equipment model alone, on its latest real day
+    visual_phase: str | None = None  # the latest visual reading alone
+    equipment_days: int | None = None  # days in the window with real equipment observations
+    visual_days: int | None = None  # days in the window with visual readings
+    # How stale the estimate is: services/phase does NOT advance the phase
+    # past the last observation (that would silently assume on-schedule
+    # progress and hide a delay).
+    days_since_last_observation: int | None = None
     error: str | None = None
 
 

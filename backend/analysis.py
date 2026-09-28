@@ -40,6 +40,17 @@ trained ConstructionPhaseModel for phase, the Earned-Schedule forecast for
 delay — see each worker's module docstring for what's faithful to training
 and what's a live-inference simplification.
 
+Visual phase: `services/visual_phase`'s per-entry phase probabilities are
+persisted as JSON (`JournalEntry.visual_phase_details`) and sent — for every
+entry in the equipment-history window — to `services/phase` as
+`visual_history`, which fuses them with the equipment model over the
+project's history (see services/phase/fusion.py). So `_maybe_advance_entry`
+waits for BOTH every file's vision result AND the entry's visual-phase
+result before firing phase.command; a visual result that never comes is
+replaced by a `{"status": "timeout"}` marker after `VISUAL_PHASE_TIMEOUT_S`,
+so a down visual service delays an entry but never blocks it. The entry's
+phase_name is services/phase's answer as-is — no second fusion here.
+
 `handle_delay_result` is also where blocks 5/6 (GPT narrative reports, see
 `report.py`) run: once an entry is `ready`, it builds that entry's
 structured facts (`_build_entry_facts`) and generates its own narrative
@@ -56,7 +67,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, func, select
@@ -65,7 +76,6 @@ from sqlalchemy.orm import selectinload
 if TYPE_CHECKING:
     from fastapi import BackgroundTasks
 
-import phase_ensemble
 import report
 from config import settings
 from database import SessionLocal
@@ -73,6 +83,7 @@ from integrations import broker
 from integrations.schemas import (
     CANONICAL_PHASES,
     DailyEquipmentCounts,
+    DailyVisualPhase,
     DelayForecastCommand,
     DelayForecastResult,
     DetectCommand,
@@ -97,6 +108,18 @@ from progress import PhaseObservation, estimate_phase_start
 # even near the start of the requested window.
 EQUIPMENT_HISTORY_DAYS = 200
 
+# How long `_maybe_advance_entry` waits for an entry's visual-phase result
+# before giving up on it (see `_visual_phase_timeout`). Vision on a long
+# video usually takes longer than this anyway, so in practice the wait only
+# matters when services/visual_phase is down or backlogged.
+VISUAL_PHASE_TIMEOUT_S = 600.0
+
+# Strong refs to fire-and-forget tasks (asyncio only keeps weak ones).
+_background_tasks: set[asyncio.Task] = set()
+
+# Older than this, the summary warns that the phase estimate is stale.
+STALE_OBSERVATION_DAYS = 14
+
 log = logging.getLogger("csm.analysis")
 
 
@@ -113,9 +136,19 @@ def _summarize_equipment(counts: list[EquipmentCount]) -> str:
     return f"В кадре обнаружена техника: {parts}."
 
 
-def _summarize_phase(phase_name: str, confidence: float | None) -> str:
-    confidence_pct = round((confidence or 0) * 100)
-    return f"Текущая фаза объекта: {phase_name} (уверенность {confidence_pct}%)."
+def _summarize_phase(result: PhaseResult) -> str:
+    confidence_pct = round((result.confidence or 0) * 100)
+    text = f"Текущая фаза объекта: {result.phase_name} (уверенность {confidence_pct}%)."
+    if result.equipment_phase or result.visual_phase:
+        text += (
+            f" По технике: {result.equipment_phase or 'нет данных'},"
+            f" по изображению: {result.visual_phase or 'нет данных'}."
+        )
+        if result.equipment_phase and result.visual_phase and result.equipment_phase != result.visual_phase:
+            text += " Сигналы расходятся — оценку стоит проверить."
+    if result.days_since_last_observation and result.days_since_last_observation > STALE_OBSERVATION_DAYS:
+        text += f" Последнее наблюдение — {result.days_since_last_observation} дн. назад."
+    return text
 
 
 def _summarize_delay(stage_summary: str | None, result: DelayForecastResult) -> str:
@@ -208,6 +241,68 @@ async def _load_equipment_history(db, project_id: uuid.UUID) -> list[DailyEquipm
         )
         for r in reversed(rows)
     ]
+
+
+async def _load_visual_history(db, project_id: uuid.UUID, as_of_date: date) -> list[DailyVisualPhase]:
+    """Every journal entry's visual-phase probabilities (see
+    `handle_visual_phase_result`) within the same look-back as the equipment
+    history, up to and including `as_of_date`. Entries without a usable
+    result (failed, timed out, or analysed before visual_phase sent
+    `phase_probs`) are skipped; several entries on one date are sent
+    separately and averaged by services/phase."""
+    since = as_of_date - timedelta(days=EQUIPMENT_HISTORY_DAYS)
+    rows = (
+        await db.execute(
+            select(JournalEntry.date, JournalEntry.visual_phase_details)
+            .where(
+                JournalEntry.project_id == project_id,
+                JournalEntry.visual_phase_details.is_not(None),
+                JournalEntry.date <= as_of_date,
+                JournalEntry.date >= since,
+            )
+            .order_by(JournalEntry.date)
+        )
+    ).all()
+    out = []
+    for d, raw in rows:
+        try:
+            details = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        probs = details.get("phase_probs") if details.get("status") == "done" else None
+        if probs:
+            out.append(DailyVisualPhase(date=d, phase_probs=probs))
+    return out
+
+
+def _on_background_task_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.error("background analysis task failed", exc_info=task.exception())
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_on_background_task_done)
+
+
+async def _visual_phase_timeout(entry_id: uuid.UUID, delay_s: float | None = None) -> None:
+    """If the entry's visual-phase result hasn't arrived after `delay_s`
+    (default: `VISUAL_PHASE_TIMEOUT_S`, read at call time), record a timeout
+    marker so `_maybe_advance_entry` stops waiting for it. Lost on restart
+    like any in-process timer — `requeue_pending` re-arms it."""
+    if delay_s is None:
+        delay_s = VISUAL_PHASE_TIMEOUT_S
+    await asyncio.sleep(delay_s)
+    async with SessionLocal() as db:
+        entry = await db.get(JournalEntry, entry_id)
+        if entry is None or entry.analysis_status != "analyzing" or entry.visual_phase_details is not None:
+            return
+        log.warning("visual phase result for entry %s timed out after %ss", entry_id, delay_s)
+        entry.visual_phase_details = json.dumps({"status": "timeout"})
+        await db.commit()
+    await _maybe_advance_entry(entry_id)
 
 
 async def _project_planned_start(db, project_id: uuid.UUID) -> date | None:
@@ -408,22 +503,19 @@ async def run_entry_analysis(entry_id: uuid.UUID) -> None:
         if entry is None or not entry.media:
             return
         entry.analysis_status = "analyzing"
-        # новый прогон — прошлые сигналы фазы не должны попасть в ансамбль
-        entry.equipment_phase_probs = None
-        entry.visual_phase_probs = None
-        entry.visual_phase_status = "pending"
+        # Re-analysis must wait for a fresh visual result, not reuse the old one.
+        entry.visual_phase_details = None
         media = list(entry.media)
         await db.commit()
 
     for asset in media:
         await run_analysis(asset.id)
 
-    # One representative file for the visual-phase signal, not one call per
-    # file voted together — see services/visual_phase/worker.py's docstring:
-    # its classifier is a coarse 8-cluster nearest-centroid model, not
-    # precise enough that averaging several photos' independent reads would
-    # meaningfully beat just reading one. A photo is a cleaner single-frame
-    # target than a video frame grab, so prefer one if the entry has any.
+    # One representative file for the visual-phase signal. A photo is
+    # preferred: the visual classifier was evaluated on photos, and video
+    # frames are lower-res/blurrier (a video still gets several frames
+    # averaged, see services/visual_phase/worker.py). Sending every file and
+    # averaging would be a possible next step.
     representative = next((a for a in media if a.kind == "image"), media[0])
     visual_command = VisualPhaseCommand(
         # Not a MediaAsset id here — the visual-phase result is entry-level,
@@ -435,6 +527,7 @@ async def run_entry_analysis(entry_id: uuid.UUID) -> None:
     )
     visual_body = _envelope(entry_id, visual_command).model_dump_json().encode()
     await broker.publish(broker.VISUAL_PHASE_COMMAND, visual_body)
+    _spawn(_visual_phase_timeout(entry_id))
 
 
 async def handle_vision_result(envelope: Envelope[DetectResult]) -> None:
@@ -475,7 +568,8 @@ async def handle_vision_result(envelope: Envelope[DetectResult]) -> None:
 
 async def _maybe_advance_entry(entry_id: uuid.UUID) -> None:
     """Fires the entry's ONE phase.command once every one of its files has
-    reported its own vision result (ready or failed) — this is what turns
+    reported its own vision result (ready or failed) AND the entry's visual-
+    phase result is in (done, failed or timed out) — this is what turns
     N files' worth of vision results back into a single combined phase call
     instead of N redundant ones. Re-entrant and lock-free: harmless (if a
     little wasteful) to call more than once for the same entry, since it
@@ -494,6 +588,8 @@ async def _maybe_advance_entry(entry_id: uuid.UUID) -> None:
         ).scalars().all()
         if not assets or any(a.analysis_status in ("pending", "analyzing") for a in assets):
             return  # still waiting on some file's vision result
+        if entry.visual_phase_details is None:
+            return  # still waiting on the visual-phase result (or its timeout)
         if all(a.analysis_status == "failed" for a in assets):
             entry.analysis_status = "failed"
             await db.commit()
@@ -517,10 +613,14 @@ async def _maybe_advance_entry(entry_id: uuid.UUID) -> None:
         plan = await _load_plan(db, entry.project_id)
         history = await _load_equipment_history(db, entry.project_id)
         as_of_date = entry.date
+        visual_history = await _load_visual_history(db, entry.project_id, as_of_date)
         await db.commit()
 
     command = PhaseCommand(
-        plan_stages=plan.phases if plan else [], history=history, as_of_date=as_of_date
+        plan_stages=plan.phases if plan else [],
+        history=history,
+        as_of_date=as_of_date,
+        visual_history=visual_history,
     )
     body = _envelope(entry_id, command).model_dump_json().encode()
     await broker.publish(broker.PHASE_COMMAND, body)
@@ -529,16 +629,16 @@ async def _maybe_advance_entry(entry_id: uuid.UUID) -> None:
 async def handle_visual_phase_result(envelope: Envelope[VisualPhaseResult]) -> None:
     """Persists services/visual_phase's result on the journal entry it was
     computed for (`run_entry_analysis` fires exactly one visual_phase.command
-    per entry, against one representative file) and hands it to the phase
-    ensemble (`_maybe_finalize_phase`): the entry's final phase_name is the
-    equipment-based phase fused with this one — see phase_ensemble.py. A
-    `failed` status just means "no visual signal": the ensemble goes ahead
-    on equipment alone, it never fails the entry.
+    per entry). The full result goes into `visual_phase_details` (JSON) —
+    phase probabilities for services/phase's fusion, evidence for the
+    expert-facing report — whatever its status: a `failed` result is stored
+    too, since its arrival is what `_maybe_advance_entry` waits for. The
+    phase name/confidence columns are only filled on success.
 
-    Only a result that arrives while the ensemble is still waiting for it
-    re-triggers finalization — a late reply after the wait already timed out
-    is kept for display but doesn't recompute the phase (and re-run
-    delay/narratives) for an entry that has moved on."""
+    A result arriving after the entry already moved on (timed out, or
+    re-analysis started) is still stored — it then feeds the visual history
+    of the project's later entries — but only an entry still in analysis
+    gets advanced (`_maybe_advance_entry` checks that itself)."""
     entry_id = envelope.correlation_id
     result = envelope.payload
 
@@ -546,105 +646,45 @@ async def handle_visual_phase_result(envelope: Envelope[VisualPhaseResult]) -> N
         entry = await db.get(JournalEntry, entry_id)
         if entry is None:
             return
-        was_waiting = entry.visual_phase_status == "pending"
-        if result.status == "failed" or result.phase_name is None:
-            log.warning("visual_phase gave no signal for entry %s: %s", entry_id, result.error)
-            if was_waiting:
-                entry.visual_phase_status = "failed"
-        else:
+        entry.visual_phase_details = result.model_dump_json()
+        if result.status == "done" and result.phase_name is not None:
             entry.visual_phase_name = result.phase_name
             entry.visual_phase_confidence = result.confidence
-            probs = result.probs or phase_ensemble.from_point_estimate(result.phase_name, result.confidence)
-            entry.visual_phase_probs = json.dumps(probs) if probs else None
-            if was_waiting:
-                entry.visual_phase_status = "done"
+        else:
+            log.warning("visual phase failed for entry %s: %s", entry_id, result.error)
         await db.commit()
 
-    if was_waiting:
-        await _maybe_finalize_phase(entry_id)
+    await _maybe_advance_entry(entry_id)
 
 
 async def handle_phase_result(envelope: Envelope[PhaseResult]) -> None:
-    """Keeps the equipment-based phase distribution and finalizes the
-    entry's phase as soon as visual_phase has also answered (or failed); if
-    it hasn't yet, finalization waits for it, bounded by
-    VISUAL_PHASE_WAIT_SECONDS so a down visual_phase service can't stall the
-    pipeline."""
+    """services/phase's answer IS the entry's phase — it already fused the
+    equipment and visual signals over the project's history. Persist it and
+    run the delay forecast off it."""
     entry_id = envelope.correlation_id
     result = envelope.payload
     if result.status == "failed" or result.phase_name is None:
         await _mark_entry_failed(entry_id, "phase", result.error)
         return
 
+    phase_name = result.phase_name
+    confidence = result.confidence if result.confidence is not None else 1.0
     async with SessionLocal() as db:
         entry = await db.get(JournalEntry, entry_id)
         if entry is None:
             return
-        probs = result.probs or phase_ensemble.from_point_estimate(result.phase_name, result.confidence)
-        entry.equipment_phase_probs = json.dumps(probs)
-        waiting = entry.visual_phase_status == "pending"
-        await db.commit()
-
-    if waiting:
-        task = asyncio.create_task(_finalize_after_wait(entry_id))
-        _background_tasks.add(task)
-        task.add_done_callback(_on_background_task_done)
-    await _maybe_finalize_phase(entry_id)
-
-
-# Сколько ждать visual_phase после того, как пришла фаза по технике.
-VISUAL_PHASE_WAIT_SECONDS = 180.0
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _on_background_task_done(task: asyncio.Task) -> None:
-    _background_tasks.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        log.error("background phase finalization failed", exc_info=task.exception())
-
-
-async def _finalize_after_wait(entry_id: uuid.UUID) -> None:
-    await asyncio.sleep(VISUAL_PHASE_WAIT_SECONDS)
-    async with SessionLocal() as db:
-        entry = await db.get(JournalEntry, entry_id)
-        if entry is None or entry.visual_phase_status != "pending":
-            return  # visual_phase answered in time — already finalized
-        log.warning("visual_phase didn't answer entry %s in %.0fs — phase from equipment alone", entry_id, VISUAL_PHASE_WAIT_SECONDS)
-        entry.visual_phase_status = "timeout"
-        await db.commit()
-    await _maybe_finalize_phase(entry_id)
-
-
-async def _maybe_finalize_phase(entry_id: uuid.UUID) -> None:
-    """The entry's final phase = phase_ensemble.fuse(equipment, visual) —
-    once the equipment result is in and visual_phase is no longer pending.
-    Then the delay forecast runs off that final phase, exactly as it used to
-    run off services/phase's raw answer. Like `_maybe_advance_entry`, not
-    locked: a duplicate call just recomputes the same phase and re-publishes
-    delay.command, which every consumer already tolerates."""
-    async with SessionLocal() as db:
-        entry = await db.get(JournalEntry, entry_id)
-        if entry is None or entry.equipment_phase_probs is None or entry.visual_phase_status == "pending":
-            return
-        equipment = json.loads(entry.equipment_phase_probs)
-        visual = (
-            json.loads(entry.visual_phase_probs)
-            if entry.visual_phase_status == "done" and entry.visual_phase_probs
-            else None
-        )
-        fused = phase_ensemble.fuse(equipment, visual)
-        phase_name, confidence = phase_ensemble.top(fused)
         log.info(
-            "entry %s phase: %s %.0f%% (equipment %s, visual %s)",
+            "entry %s phase: %s %.0f%% (equipment %s, visual %s, %s days since last observation)",
             entry_id,
             phase_name,
             confidence * 100,
-            "%s %.0f%%" % phase_ensemble.top(equipment),
-            "%s %.0f%%" % phase_ensemble.top(visual) if visual else entry.visual_phase_status,
+            result.equipment_phase,
+            result.visual_phase,
+            result.days_since_last_observation,
         )
-        entry.stage_summary = _summarize_phase(phase_name, confidence)
+        entry.stage_summary = _summarize_phase(result)
         entry.phase_name = phase_name
-        entry.phase_confidence = confidence
+        entry.phase_confidence = result.confidence
         plan = await _load_plan(db, entry.project_id)
         planned_start = await _project_planned_start(db, entry.project_id)
         as_of_date = entry.date
@@ -769,3 +809,6 @@ async def requeue_pending() -> None:
         asyncio.create_task(run_analysis(asset_id))
     for entry_id in analyzing_entries:
         asyncio.create_task(_maybe_advance_entry(entry_id))
+        # The in-process visual-phase timer died with the old process; if the
+        # result is still missing, give it a fresh (full) wait and then move on.
+        _spawn(_visual_phase_timeout(entry_id))
